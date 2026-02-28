@@ -21,7 +21,7 @@ set_redis_client(redis_client)
 kafka_infra = StockKafkaInfrastructure(dispatcher=stock_dispatcher)
 
 kafka_infra.start()
-@app.route("/stock/item/create/<price>", methods=["POST"])
+@app.route("/item/create/<price>", methods=["POST"])
 def create_item(price):
     item_id = str(uuid.uuid4())
     redis_client.hset(f"item:{item_id}", mapping={
@@ -31,7 +31,7 @@ def create_item(price):
     return jsonify({"item_id": item_id}), 200
 
 
-@app.route("/stock/find/<item_id>", methods=["GET"])
+@app.route("/find/<item_id>", methods=["GET"])
 def find_item(item_id):
     item = redis_client.hgetall(f"item:{item_id}")
     if not item:
@@ -43,7 +43,7 @@ def find_item(item_id):
     }), 200
 
 
-@app.route("/stock/add/<item_id>/<amount>", methods=["POST"])
+@app.route("/add/<item_id>/<amount>", methods=["POST"])
 def add_stock(item_id, amount):
     key = f"item:{item_id}"
     if not redis_client.exists(key):
@@ -53,7 +53,7 @@ def add_stock(item_id, amount):
     return jsonify({"done": True}), 200
 
 
-@app.route("/stock/subtract/<item_id>/<amount>", methods=["POST"])
+@app.route("/subtract/<item_id>/<amount>", methods=["POST"])
 def subtract_stock(item_id, amount):
     key = f"item:{item_id}"
 
@@ -70,4 +70,4 @@ def subtract_stock(item_id, amount):
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+    app.run(host="0.0.0.0", port=8000)
