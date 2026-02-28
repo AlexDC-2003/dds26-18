@@ -36,6 +36,10 @@ services:
   stock-service:
     build: ./stock
     image: stock:latest
+    environment:
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      - KAFKA_STOCK_COMMANDS_TOPIC=stock.commands
+      - KAFKA_STOCK_REPLIES_TOPIC=stock.replies
     command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
     env_file:
       - env/stock_redis.env
