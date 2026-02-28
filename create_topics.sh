@@ -2,15 +2,18 @@
 
 topics=(
   "order"
-  "stock"
-  "payment"
+  "stock.commands"
+  "stock.replies"
+  "payment.commands"
+  "payment.replies"
 )
 
 for topic in "${topics[@]}"; do
   echo "🚀 Creating Kafka topic: $topic"
-  docker compose exec kafka /bin/kafka-topics --create \
+  kafka-topics --create \
+    --if-not-exists  \
     --topic "$topic" \
     --bootstrap-server kafka:9092 \
-    --partitions 6 \
+    --partitions 3 \
     --replication-factor 1
 done

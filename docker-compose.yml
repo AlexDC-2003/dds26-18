@@ -17,17 +17,22 @@ services:
     image: order:latest
     environment:
       - GATEWAY_URL=http://gateway:80
-      - KAFKA_BOOTSTRAP_SERVERS="kafka:9092"
-      - KAFKA_STOCK_COMMANDS_TOPIC="stock.commands"
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      - KAFKA_STOCK_COMMANDS_TOPIC=stock.commands
       - KAFKA_REPLIES_TOPICS=stock.replies,payment.replies
-      - KAFKA_PAYMENT_COMMANDS_TOPIC="payment.commands"
-      - INTERNAL_TRANSPORT="rest"   # later switch to "kafka"
+      - KAFKA_PAYMENT_COMMANDS_TOPIC=payment.commands
+      - INTERNAL_TRANSPORT=kafka  # later switch to "kafka"
       - KAFKA_REQUEST_TIMEOUT_SEC=2
-    command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
+    command: gunicorn -b 0.0.0.0:5000 -w 1 --timeout 30 --log-level=info app:app
     env_file:
       - env/order_redis.env
     depends_on:
-      - order-db
+      order-db:
+        condition: service_started
+      kafka:
+        condition: service_healthy
+      kafka-setup:
+        condition: service_completed_successfully
 
   order-db:
     image: redis:7.2-bookworm
@@ -40,11 +45,16 @@ services:
       - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
       - KAFKA_STOCK_COMMANDS_TOPIC=stock.commands
       - KAFKA_STOCK_REPLIES_TOPIC=stock.replies
-    command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
+    command: gunicorn -b 0.0.0.0:5000 -w 1 --timeout 30 --log-level=info app:app
     env_file:
       - env/stock_redis.env
     depends_on:
-      - stock-db
+      stock-db:
+        condition: service_started
+      kafka:
+        condition: service_healthy
+      kafka-setup:
+        condition: service_completed_successfully
 
   stock-db:
     image: redis:7.2-bookworm
@@ -53,11 +63,16 @@ services:
   payment-service:
     build: ./payment
     image: user:latest
-    command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
+    command: gunicorn -b 0.0.0.0:5000 -w 1 --timeout 30 --log-level=info app:app
     env_file:
       - env/payment_redis.env
     depends_on:
-      - payment-db
+      payment-db:
+        condition: service_started
+      kafka:
+        condition: service_healthy
+      kafka-setup:
+        condition: service_completed_successfully
 
   payment-db:
     image: redis:7.2-bookworm
@@ -82,10 +97,11 @@ services:
     environment:
       KAFKA_BROKER_ID: 1
       KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_OFFSETS_TOPIC_NUM_PARTITIONS: 1
       KAFKA_NUM_PARTITIONS: ${KAFKA_PARTITIONS:-1}
     healthcheck:
       test: ["CMD", "kafka-topics", "--bootstrap-server", "kafka:9092", "--list"]
@@ -104,3 +120,13 @@ services:
       KAFKA_CLUSTERS_0_ZOOKEEPER: zookeeper:2181
     depends_on:
       - kafka
+
+  kafka-setup:
+    image: confluentinc/cp-kafka:7.6.1
+    depends_on:
+      kafka:
+        condition: service_healthy
+    volumes:
+      - ./create_topics.sh:/create_topics.sh:ro
+    entrypoint: [ "/bin/bash", "/create_topics.sh" ]
+    restart: "no"

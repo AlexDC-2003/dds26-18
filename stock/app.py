@@ -20,16 +20,7 @@ set_redis_client(redis_client)
 
 kafka_infra = StockKafkaInfrastructure(dispatcher=stock_dispatcher)
 
-
-@app.before_first_request
-def start_kafka():
-    kafka_infra.start()
-
-
-# ---------------------------
-# REST API (unchanged)
-# ---------------------------
-
+kafka_infra.start()
 @app.route("/stock/item/create/<price>", methods=["POST"])
 def create_item(price):
     item_id = str(uuid.uuid4())
@@ -79,5 +70,4 @@ def subtract_stock(item_id, amount):
 
 
 if __name__ == "__main__":
-    kafka_infra.start()
     app.run(host="0.0.0.0", port=5000)
