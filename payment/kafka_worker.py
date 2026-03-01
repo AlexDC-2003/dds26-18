@@ -9,6 +9,8 @@ import redis
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
 from msgspec import Struct, msgpack
 
+from lock_manager import LockManager, WaitDieAbort, LockTimeout, transaction_context
+
 
 class UserValue(Struct):
     credit: int
@@ -57,10 +59,14 @@ class PaymentKafkaWorker:
     Idempotency:
       - Successful charges are recorded at key pay_tx:<tx_id>
       - Successful refunds are recorded at key refund_tx:<tx_id>
-      - Failures (insufficient funds) are NOT recorded, so a retry after adding funds can succeed.
+      - Failures (insufficient funds) are NOT recorded so a retry after adding funds can succeed.
 
-    Atomicity:
-      - Uses Redis WATCH/MULTI/EXEC (optimistic concurrency) to prevent race conditions.
+    Atomicity & Concurrency:
+      - Uses 2-Phase Locking (2PL) with Wait-Die deadlock prevention.
+      - The lock manager stores lock state in Redis, so it works across replicas.
+      - Growing phase: acquire all needed locks before any read/write.
+      - Shrinking phase: release all locks after the operation completes.
+      - Wait-Die rule: an older transaction waits; a younger one aborts.
 
     #TODO(order-service): In kafka mode, order/app.py currently assumes `reply.status_code` like a
     `requests.Response`. Kafka replies are dicts, so order-service must use `reply["status_code"]`
@@ -73,6 +79,7 @@ class PaymentKafkaWorker:
 
     def __init__(self, *, db: redis.Redis) -> None:
         self._db = db
+        self._lock_manager = LockManager(db=db)
 
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._thread: Optional[threading.Thread] = None
@@ -82,7 +89,7 @@ class PaymentKafkaWorker:
         self._commands_topic = os.environ.get("KAFKA_PAYMENT_COMMANDS_TOPIC", "payment.commands")
         self._replies_topic = os.environ.get("KAFKA_PAYMENT_REPLIES_TOPIC", "payment.replies")
 
-        # Use a consumer group so multiple payment instances share work
+        # Use a consumer group so multiple payment instances share work.
         self._group_id = os.environ.get("KAFKA_PAYMENT_GROUP_ID", "payment-service")
 
         self._producer: Optional[AIOKafkaProducer] = None
@@ -176,6 +183,10 @@ class PaymentKafkaWorker:
         typ = cmd.get("type")
         payload = cmd.get("payload") or {}
 
+        # tx_ts allows the order service to propagate the saga's birth timestamp
+        # so that 2PL age comparisons are meaningful across services.
+        tx_ts = cmd.get("tx_ts")  # optional float; defaults to now inside Transaction
+
         base = {
             "msg_id": msg_id,
             "tx_id": tx_id,
@@ -193,7 +204,7 @@ class PaymentKafkaWorker:
             if typ == "charge_user":
                 user_id = str(payload.get("user_id", ""))
                 amount = int(payload.get("amount", 0))
-                ok, err, new_credit = self._charge_user(tx_id, user_id, amount)
+                ok, err, new_credit = self._charge_user(tx_id, user_id, amount, tx_ts=tx_ts)
                 if ok:
                     base["status_code"] = 200
                     base["payload"] = {"user_id": user_id, "amount": amount, "credit": new_credit}
@@ -204,10 +215,9 @@ class PaymentKafkaWorker:
             if typ == "refund_user":
                 user_id = str(payload.get("user_id", ""))
                 amount = int(payload.get("amount", 0))
-                ok, err, new_credit = self._refund_user(tx_id, user_id, amount)
+                ok, err, new_credit = self._refund_user(tx_id, user_id, amount, tx_ts=tx_ts)
                 if ok:
                     base["status_code"] = 200
-                    # new_credit can be None in the safe no-op case
                     base["payload"] = {"user_id": user_id, "amount": amount, "credit": new_credit}
                 else:
                     base["error"] = err
@@ -225,7 +235,18 @@ class PaymentKafkaWorker:
             base["error"] = f"exception: {type(e).__name__}: {e}"
             return base
 
-    def _charge_user(self, tx_id: str, user_id: str, amount: int) -> Tuple[bool, str | None, int | None]:
+    # ------------------------------------------------------------------
+    # Business logic — protected by 2PL
+    # ------------------------------------------------------------------
+
+    def _charge_user(
+        self,
+        tx_id: str,
+        user_id: str,
+        amount: int,
+        *,
+        tx_ts: Optional[float] = None,
+    ) -> Tuple[bool, Optional[str], Optional[int]]:
         if not user_id:
             return False, "missing user_id", None
         if amount <= 0:
@@ -233,58 +254,69 @@ class PaymentKafkaWorker:
 
         tx_key = f"pay_tx:{tx_id}"
 
-        # Fast idempotency check
+        # Fast idempotency check (no lock needed — tx record is immutable once written).
         existing = self._db.get(tx_key)
         if existing:
             tx = msgpack.decode(existing, type=ChargeTxValue)
             return True, None, tx.credit_after
 
-        user_key = user_id
+        # Resources we need to lock (sorted inside transaction_context too, but
+        # explicit ordering here makes the intent clear):
+        #   1. user record
+        #   2. idempotency key for this transaction
+        resources = [f"user:{user_id}", f"pay_tx:{tx_id}"]
 
-        # Optimistic concurrency loop
-        for _ in range(10):
-            pipe = self._db.pipeline()
-            try:
-                pipe.watch(user_key, tx_key)
+        try:
+            with transaction_context(
+                self._lock_manager,
+                resources,
+                tx_id=tx_id,
+                ts=tx_ts,
+            ) as txn:
+                # ---- Growing phase complete; now read and write ----
 
-                # Re-check idempotency after WATCH
-                existing2 = pipe.get(tx_key)
+                # Re-check idempotency under lock.
+                existing2 = self._db.get(tx_key)
                 if existing2:
                     tx = msgpack.decode(existing2, type=ChargeTxValue)
-                    pipe.unwatch()
                     return True, None, tx.credit_after
 
-                raw_user = pipe.get(user_key)
+                raw_user = self._db.get(user_id)
                 if not raw_user:
-                    pipe.unwatch()
                     return False, f"User: {user_id} not found!", None
 
                 user = msgpack.decode(raw_user, type=UserValue)
                 if user.credit < amount:
-                    pipe.unwatch()
                     return False, "User out of credit", None
 
                 user.credit -= amount
                 now = time.time()
-                tx = ChargeTxValue(user_id=user_id, amount=amount, credit_after=user.credit, ts=now)
+                tx_record = ChargeTxValue(
+                    user_id=user_id, amount=amount, credit_after=user.credit, ts=now
+                )
 
-                pipe.multi()
-                pipe.set(user_key, msgpack.encode(user))
-                pipe.set(tx_key, msgpack.encode(tx))
+                pipe = self._db.pipeline(transaction=True)
+                pipe.set(user_id, msgpack.encode(user))
+                pipe.set(tx_key, msgpack.encode(tx_record))
                 pipe.execute()
+
                 return True, None, user.credit
 
-            except redis.WatchError:
-                continue
-            finally:
-                try:
-                    pipe.reset()
-                except Exception:
-                    pass
+        except WaitDieAbort as e:
+            return False, f"wait-die abort: {e}", None
+        except LockTimeout as e:
+            return False, f"lock timeout: {e}", None
+        except redis.exceptions.RedisError as e:
+            return False, f"DB error: {e}", None
 
-        return False, "concurrent update; retry", None
-
-    def _refund_user(self, tx_id: str, user_id: str, amount: int) -> Tuple[bool, str | None, int | None]:
+    def _refund_user(
+        self,
+        tx_id: str,
+        user_id: str,
+        amount: int,
+        *,
+        tx_ts: Optional[float] = None,
+    ) -> Tuple[bool, Optional[str], Optional[int]]:
         if not user_id:
             return False, "missing user_id", None
         if amount <= 0:
@@ -293,53 +325,56 @@ class PaymentKafkaWorker:
         charge_tx_key = f"pay_tx:{tx_id}"
         refund_tx_key = f"refund_tx:{tx_id}"
 
-        # Idempotency: already refunded
+        # Fast idempotency check — already refunded.
         existing_refund = self._db.get(refund_tx_key)
         if existing_refund:
             tx = msgpack.decode(existing_refund, type=RefundTxValue)
             return True, None, tx.credit_after
 
-        # Safe no-op: never charged
+        # Safe no-op — never charged, so nothing to refund.
         existing_charge = self._db.get(charge_tx_key)
         if not existing_charge:
             return True, None, None
 
-        user_key = user_id
+        resources = [f"user:{user_id}", f"refund_tx:{tx_id}"]
 
-        for _ in range(10):
-            pipe = self._db.pipeline()
-            try:
-                pipe.watch(user_key, refund_tx_key)
+        try:
+            with transaction_context(
+                self._lock_manager,
+                resources,
+                tx_id=tx_id,
+                ts=tx_ts,
+            ) as txn:
+                # ---- Growing phase complete ----
 
-                existing2 = pipe.get(refund_tx_key)
+                # Re-check idempotency under lock.
+                existing2 = self._db.get(refund_tx_key)
                 if existing2:
                     tx = msgpack.decode(existing2, type=RefundTxValue)
-                    pipe.unwatch()
                     return True, None, tx.credit_after
 
-                raw_user = pipe.get(user_key)
+                raw_user = self._db.get(user_id)
                 if not raw_user:
-                    pipe.unwatch()
                     return False, f"User: {user_id} not found!", None
 
                 user = msgpack.decode(raw_user, type=UserValue)
                 user.credit += amount
 
                 now = time.time()
-                tx = RefundTxValue(user_id=user_id, amount=amount, credit_after=user.credit, ts=now)
+                tx_record = RefundTxValue(
+                    user_id=user_id, amount=amount, credit_after=user.credit, ts=now
+                )
 
-                pipe.multi()
-                pipe.set(user_key, msgpack.encode(user))
-                pipe.set(refund_tx_key, msgpack.encode(tx))
+                pipe = self._db.pipeline(transaction=True)
+                pipe.set(user_id, msgpack.encode(user))
+                pipe.set(refund_tx_key, msgpack.encode(tx_record))
                 pipe.execute()
+
                 return True, None, user.credit
 
-            except redis.WatchError:
-                continue
-            finally:
-                try:
-                    pipe.reset()
-                except Exception:
-                    pass
-
-        return False, "concurrent update; retry", None
+        except WaitDieAbort as e:
+            return False, f"wait-die abort: {e}", None
+        except LockTimeout as e:
+            return False, f"lock timeout: {e}", None
+        except redis.exceptions.RedisError as e:
+            return False, f"DB error: {e}", None

@@ -1,6 +1,7 @@
 import atexit
 import logging
 import os
+import time
 import uuid
 
 import redis
@@ -8,6 +9,7 @@ from flask import Flask, Response, abort, jsonify
 from msgspec import Struct, msgpack
 
 from kafka_worker import PaymentKafkaWorker
+from lock_manager import LockManager, LockTimeout, WaitDieAbort, transaction_context
 
 DB_ERROR_STR = "DB error"
 
@@ -20,6 +22,8 @@ db: redis.Redis = redis.Redis(
     password=os.environ["REDIS_PASSWORD"],
     db=int(os.environ["REDIS_DB"]),
 )
+
+lock_manager = LockManager(db=db)
 
 
 def close_db_connection() -> None:
@@ -45,47 +49,48 @@ def get_user_from_db(user_id: str) -> UserValue:
     return user
 
 
-def _update_credit_atomic(user_id: str, delta: int) -> int:
-    """Atomically apply delta to user credit using WATCH/MULTI/EXEC.
+def _update_credit_2pl(user_id: str, delta: int) -> int:
+    """Apply *delta* to user credit under a 2PL exclusive lock.
 
-    - delta > 0: add funds
-    - delta < 0: subtract funds (fails if it would go below 0)
+    Each REST call is its own short-lived transaction with a fresh timestamp,
+    so it will always be "younger" than any long-running saga transaction and
+    will die (retry at the HTTP level) rather than blocking the saga.
 
-    Returns new credit.
+    Returns the new credit balance.
+    Aborts (raises) on lock conflict, DB error, or insufficient funds.
     """
-    for _ in range(10):
-        pipe = db.pipeline()
-        try:
-            pipe.watch(user_id)
-            raw = pipe.get(user_id)
+    resources = [f"user:{user_id}"]
+
+    try:
+        with transaction_context(lock_manager, resources) as txn:
+            # ---- Growing phase complete ----
+            try:
+                raw = db.get(user_id)
+            except redis.exceptions.RedisError:
+                abort(400, DB_ERROR_STR)
+
             if not raw:
-                pipe.unwatch()
                 abort(400, f"User: {user_id} not found!")
 
             user = msgpack.decode(raw, type=UserValue)
             new_credit = user.credit + delta
+
             if new_credit < 0:
-                pipe.unwatch()
                 abort(400, f"User: {user_id} credit cannot get reduced below zero!")
 
             user.credit = new_credit
 
-            pipe.multi()
-            pipe.set(user_id, msgpack.encode(user))
-            pipe.execute()
+            try:
+                db.set(user_id, msgpack.encode(user))
+            except redis.exceptions.RedisError:
+                abort(400, DB_ERROR_STR)
+
             return new_credit
 
-        except redis.WatchError:
-            continue
-        except redis.exceptions.RedisError:
-            abort(400, DB_ERROR_STR)
-        finally:
-            try:
-                pipe.reset()
-            except Exception:
-                pass
-
-    abort(400, "Concurrent update; retry")
+    except WaitDieAbort as e:
+        abort(409, f"Transaction aborted (wait-die): {e}")
+    except LockTimeout as e:
+        abort(503, f"Could not acquire lock in time: {e}")
 
 
 # ---- External REST API (must remain unchanged) ----
@@ -124,14 +129,14 @@ def find_user(user_id: str):
 
 @app.post("/add_funds/<user_id>/<amount>")
 def add_credit(user_id: str, amount: int):
-    new_credit = _update_credit_atomic(user_id, int(amount))
+    new_credit = _update_credit_2pl(user_id, int(amount))
     return Response(f"User: {user_id} credit updated to: {new_credit}", status=200)
 
 
 @app.post("/pay/<user_id>/<amount>")
 def remove_credit(user_id: str, amount: int):
     app.logger.debug(f"Removing {amount} credit from user: {user_id}")
-    new_credit = _update_credit_atomic(user_id, -int(amount))
+    new_credit = _update_credit_2pl(user_id, -int(amount))
     return Response(f"User: {user_id} credit updated to: {new_credit}", status=200)
 
 
@@ -143,7 +148,6 @@ kafka_worker: PaymentKafkaWorker | None = None
 
 print("Payment service INTERNAL_TRANSPORT =", INTERNAL_TRANSPORT, flush=True)
 if INTERNAL_TRANSPORT == "kafka":
-    print("Matei" , flush=True)
     kafka_worker = PaymentKafkaWorker(db=db)
     kafka_worker.start()
     atexit.register(kafka_worker.stop)
