@@ -5,6 +5,7 @@ import uuid
 
 from kafka_infra import StockKafkaInfrastructure
 from saga_dispatcher import stock_dispatcher, set_redis_client
+import lock_manager
 
 app = Flask(__name__)
 
@@ -17,6 +18,7 @@ redis_client = redis.Redis(
 )
 
 set_redis_client(redis_client)
+lock_manager.set_redis_client(redis_client)  # shared redis into lock manager
 
 kafka_infra = StockKafkaInfrastructure(dispatcher=stock_dispatcher)
 

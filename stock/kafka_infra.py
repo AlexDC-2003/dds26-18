@@ -8,6 +8,7 @@ from typing import Optional, Callable, Any, Dict
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
 from aiokafka.errors import KafkaConnectionError
 
+from lock_manager import LockDeadlockAbort, MAX_RETRIES
 
 class StockKafkaInfrastructure:
 
@@ -121,16 +122,28 @@ class StockKafkaInfrastructure:
 
         async for msg in self._consumer:
             command = msg.value
+            # Run blocking dispatcher in executor so the event loop stays unblocked
+            loop = asyncio.get_event_loop()
+            reply = await loop.run_in_executor(None, self._dispatch_with_retry, command)
             try:
-                reply = self.dispatcher(command)
                 await self._producer.send_and_wait(self._replies_topic, reply)
+            except Exception as send_err:
+                print(f"Failed to send error reply: {send_err}")
 
+    def _dispatch_with_retry(self, command: Dict[str, Any]) -> Dict[str, Any]:
+        # Retry on deadlock abort (dispatcher already sleeps a random back-off before re-raising)
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                return self.dispatcher(command)
+            except LockDeadlockAbort as e:
+                if attempt < MAX_RETRIES:
+                    print(f"[2PL] Deadlock retry {attempt}/{MAX_RETRIES} for msg_id={command.get('msg_id')}")
+                else:
+                    print(f"[2PL] All {MAX_RETRIES} retries exhausted for msg_id={command.get('msg_id')}")
+                    return {"msg_id": command.get("msg_id"), "tx_id": command.get("tx_id"), "ok": False, "error": str(e)}
             except Exception as e:
                 print(f"Error processing command: {e}")
                 try:
-                    await self._producer.send_and_wait(
-                        self._replies_topic,
-                        {"msg_id": command.get("msg_id"), "tx_id": command.get("tx_id"), "ok": False, "error": str(e)}
-                    )
+                    return {"msg_id": command.get("msg_id"), "tx_id": command.get("tx_id"), "ok": False, "error": str(e)}
                 except Exception as send_err:
                     print(f"Failed to send error reply: {send_err}")
