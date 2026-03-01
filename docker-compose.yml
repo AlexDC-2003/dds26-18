@@ -105,7 +105,7 @@ services:
       KAFKA_NUM_PARTITIONS: ${KAFKA_PARTITIONS:-1}
     healthcheck:
       test: ["CMD", "kafka-topics", "--bootstrap-server", "kafka:9092", "--list"]
-      interval: 30s
+      interval: 10s
       timeout: 10s
       retries: 10
 
