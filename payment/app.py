@@ -137,11 +137,13 @@ def remove_credit(user_id: str, amount: int):
 
 # ---- Internal Kafka (event-driven) ----
 
-INTERNAL_TRANSPORT = os.environ.get("INTERNAL_TRANSPORT", "rest")
+INTERNAL_TRANSPORT = os.environ.get("INTERNAL_TRANSPORT", "kafka")
 
 kafka_worker: PaymentKafkaWorker | None = None
 
+print("Payment service INTERNAL_TRANSPORT =", INTERNAL_TRANSPORT, flush=True)
 if INTERNAL_TRANSPORT == "kafka":
+    print("Matei" , flush=True)
     kafka_worker = PaymentKafkaWorker(db=db)
     kafka_worker.start()
     atexit.register(kafka_worker.stop)
