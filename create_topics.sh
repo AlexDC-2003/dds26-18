@@ -4,8 +4,8 @@ topics=(
   "order"
   "payment.commands"
   "payment.replies"
-  "stock.commands"
   "stock.replies"
+  "stock.commands"
 )
 
 for topic in "${topics[@]}"; do

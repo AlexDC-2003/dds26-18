@@ -27,8 +27,10 @@ services:
     env_file:
       - env/order_redis.env
     depends_on:
-      - order-db
-      - kafka-setup
+      order-db:
+        condition: service_started
+      kafka-setup:
+        condition: service_completed_successfully
 
   order-db:
     image: redis:7.2-bookworm
