@@ -60,13 +60,20 @@ def subtract_stock(item_id, amount):
     if not redis_client.exists(key):
         return jsonify({"error": "Item not found"}), 400
 
-    current_stock = int(redis_client.hget(key, "stock"))
-
-    if current_stock < int(amount):
-        return jsonify({"error": "Insufficient stock"}), 400
-
-    redis_client.hincrby(key, "stock", -int(amount))
-    return jsonify({"done": True}), 200
+    with redis_client.pipeline() as pipe:
+        while True:
+            try:
+                pipe.watch(key)
+                current_stock = int(pipe.hget(key, "stock"))
+                if current_stock < int(amount):
+                    pipe.unwatch()
+                    return jsonify({"error": "Insufficient stock"}), 400
+                pipe.multi()
+                pipe.hincrby(key, "stock", -int(amount))
+                pipe.execute()
+                break
+            except redis.WatchError:
+                continue
 
 
 if __name__ == "__main__":

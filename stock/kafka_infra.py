@@ -83,14 +83,12 @@ class StockKafkaInfrastructure:
                 backoff = min(backoff * 2, 30.0)
 
     async def _async_start(self) -> None:
-        # Producer: serialize to JSON bytes (consistent with your command format)
         self._producer = AIOKafkaProducer(
             bootstrap_servers=self._bootstrap,
             value_serializer=lambda v: json.dumps(v).encode("utf-8"),
         )
         await self._producer.start()
 
-        # Consumer: read JSON bytes -> dict
         self._consumer = AIOKafkaConsumer(
             self._commands_topic,
             bootstrap_servers=self._bootstrap,
@@ -124,12 +122,15 @@ class StockKafkaInfrastructure:
         async for msg in self._consumer:
             command = msg.value
             try:
-                # dispatcher is sync (Redis ops) -> safe to call here
                 reply = self.dispatcher(command)
-
-                # Send reply as dict; serializer handles JSON encoding
                 await self._producer.send_and_wait(self._replies_topic, reply)
 
             except Exception as e:
-                # Don't crash the consumer loop; keep processing future messages
                 print(f"Error processing command: {e}")
+                try:
+                    await self._producer.send_and_wait(
+                        self._replies_topic,
+                        {"msg_id": command.get("msg_id"), "tx_id": command.get("tx_id"), "ok": False, "error": str(e)}
+                    )
+                except Exception as send_err:
+                    print(f"Failed to send error reply: {send_err}")

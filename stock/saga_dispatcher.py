@@ -66,7 +66,7 @@ def stock_dispatcher(command):
     # -------------------------
     # STORE RESULT (durable log)
     # -------------------------
-    redis_client.set(log_key, json.dumps(reply))
+    redis_client.set(log_key, json.dumps(reply),  ex=86400)
 
     return reply
 
