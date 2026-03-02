@@ -23,6 +23,8 @@ services:
       - KAFKA_PAYMENT_COMMANDS_TOPIC=payment.commands
       - INTERNAL_TRANSPORT=kafka  # later switch to "kafka"
       - KAFKA_REQUEST_TIMEOUT_SEC=2
+      - KAFKA_EVENTS_TOPICS=order.events
+      - KAFKA_ORDER_GROUP_ID=order-service
     command: gunicorn -b 0.0.0.0:5000 -w 1 --timeout 30 --log-level=info app:app
     env_file:
       - env/order_redis.env
@@ -45,6 +47,7 @@ services:
       - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
       - KAFKA_STOCK_COMMANDS_TOPIC=stock.commands
       - KAFKA_STOCK_REPLIES_TOPIC=stock.replies
+      - KAFKA_ORDER_EVENTS_TOPIC=order.events
     command: gunicorn -b 0.0.0.0:5000 -w 1 --timeout 30 --log-level=info app:app
     env_file:
       - env/stock_redis.env
@@ -69,7 +72,8 @@ services:
       - KAFKA_PAYMENT_COMMANDS_TOPIC=payment.commands
       - KAFKA_PAYMENT_REPLIES_TOPIC=payment.replies
       - KAFKA_PAYMENT_GROUP_ID=payment-service
-    command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
+      - KAFKA_ORDER_EVENTS_TOPIC=order.events
+    command: gunicorn -b 0.0.0.0:5000 -w 1 --timeout 30 --log-level=info app:app
     env_file:
       - env/payment_redis.env
     depends_on:

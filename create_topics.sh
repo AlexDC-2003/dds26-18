@@ -6,6 +6,7 @@ topics=(
   "stock.replies"
   "payment.commands"
   "payment.replies"
+  "order.events"
 )
 
 for topic in "${topics[@]}"; do

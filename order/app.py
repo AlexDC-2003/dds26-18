@@ -4,7 +4,6 @@ import atexit
 import random
 import uuid
 import time
-import json
 from kafka_bus import KafkaBus
 from collections import defaultdict
 
@@ -13,6 +12,7 @@ import requests
 
 from msgspec import msgpack, Struct
 from flask import Flask, jsonify, abort, Response
+from types import SimpleNamespace
 
 
 DB_ERROR_STR = "DB error"
@@ -80,10 +80,33 @@ class OrderTxValue(Struct):
     # has payment been executed successfully?
     payment_done: bool
 
+    # did we already refund after a failed finalize?
+    payment_refunded: bool
+    stock_released: bool
+
     # timestamps + error info
     created_at: float
     updated_at: float
     error: str | None
+
+def _reply_status_code(reply: dict, *, service: str) -> int:
+    # Payment worker replies with "status_code"
+    if "status_code" in reply:
+        return int(reply["status_code"])
+    # Stock dispatcher replies with "ok"
+    if "ok" in reply:
+        return 200 if reply["ok"] else 400
+    # Fallback
+    return 400
+
+def _as_response_like(reply: dict, *, service: str):
+    sc = _reply_status_code(reply, service=service)
+    # mimic the two things you use most: status_code and json()
+    return SimpleNamespace(
+        status_code=sc,
+        _raw=reply,
+        json=lambda: reply.get("payload", reply)
+    )
 
 def get_order_from_db(order_id: str) -> OrderValue | None:
     try:
@@ -176,6 +199,8 @@ def _get_or_create_tx_record(tx_id: str, order_id: str, order_entry: OrderValue)
         created_at=now,
         updated_at=now,
         error=None,
+        payment_refunded=False,
+        stock_released=False,
     )
 
     # try to create only if missing (helps if two requests race)
@@ -269,7 +294,8 @@ def reserve_stock(tx_id: str, item_id: str, quantity: int):
     reply = kafka_bus.request(
         os.environ["KAFKA_STOCK_COMMANDS_TOPIC"], cmd, timeout_sec=KAFKA_TIMEOUT_SEC
     )
-    return reply  # later interpret ok/error 
+
+    return _as_response_like(reply, service="stock")
 
 
 def release_stock(tx_id: str, item_id: str, quantity: int):
@@ -285,7 +311,7 @@ def release_stock(tx_id: str, item_id: str, quantity: int):
     reply = kafka_bus.request(
         os.environ["KAFKA_STOCK_COMMANDS_TOPIC"], cmd, timeout_sec=KAFKA_TIMEOUT_SEC
     )
-    return reply
+    return _as_response_like(reply, service="stock")
 
 
 def charge_user(tx_id: str, user_id: str, amount: int):
@@ -298,31 +324,68 @@ def charge_user(tx_id: str, user_id: str, amount: int):
         "type": "charge_user",
         "payload": {"user_id": user_id, "amount": amount},
     }
-    reply = kafka_bus.request(
-        os.environ["KAFKA_PAYMENT_COMMANDS_TOPIC"], cmd, timeout_sec=KAFKA_TIMEOUT_SEC
-    )
-    return reply
+
+    reply = kafka_bus.request(os.environ["KAFKA_PAYMENT_COMMANDS_TOPIC"], cmd, timeout_sec=KAFKA_TIMEOUT_SEC)
+    return _as_response_like(reply, service="payment")
+
+def refund_user(tx_id: str, user_id: str, amount: int):
+    if INTERNAL_TRANSPORT != "kafka":
+        return send_post_request(f"{GATEWAY_URL}/payment/add_funds/{user_id}/{amount}")
+
+    cmd = {
+        "msg_id": str(uuid.uuid4()),
+        "tx_id": tx_id,
+        "type": "refund_user",  # matches PaymentKafkaWorker
+        "payload": {"user_id": user_id, "amount": amount},
+    }
+    reply = kafka_bus.request(os.environ["KAFKA_PAYMENT_COMMANDS_TOPIC"], cmd, timeout_sec=KAFKA_TIMEOUT_SEC)
+    return _as_response_like(reply, service="payment")
 
 @app.post('/addItem/<order_id>/<item_id>/<quantity>')
 def add_item(order_id: str, item_id: str, quantity: int):
-    order_entry: OrderValue = get_order_from_db(order_id)
-    if order_entry.paid:
-        abort(400, "Order already paid; cannot add items")
-    if db.get(_order_tx_key(order_id)):
-        abort(400, "Checkout already started; cannot add items")
+    quantity = int(quantity)
     item_reply = send_get_request(f"{GATEWAY_URL}/stock/find/{item_id}")
     if item_reply.status_code != 200:
-        # Request failed because item does not exist
         abort(400, f"Item: {item_id} does not exist!")
-    item_json: dict = item_reply.json()
-    order_entry.items.append((item_id, int(quantity)))
-    order_entry.total_cost += int(quantity) * item_json["price"]
-    try:
-        db.set(order_id, msgpack.encode(order_entry))
-    except redis.exceptions.RedisError:
-        return abort(400, DB_ERROR_STR)
-    return Response(f"Item: {item_id} added to: {order_id} price updated to: {order_entry.total_cost}",
-                    status=200)
+    item_price = item_reply.json()["price"]
+
+    while True:
+        try:
+            with db.pipeline() as pipe:
+                pipe.watch(order_id)
+
+                raw = pipe.get(order_id)
+                if not raw:
+                    pipe.unwatch()
+                    abort(400, f"Order: {order_id} not found!")
+
+                order_entry: OrderValue = msgpack.decode(raw, type=OrderValue)
+
+                if order_entry.paid:
+                    pipe.unwatch()
+                    abort(400, "Order already paid; cannot add items")
+
+                if pipe.get(_order_tx_key(order_id)):
+                    pipe.unwatch()
+                    abort(400, "Checkout already started; cannot add items")
+
+                order_entry.items.append((item_id, quantity))
+                order_entry.total_cost += quantity * item_price
+
+                pipe.multi()
+                pipe.set(order_id, msgpack.encode(order_entry))
+                pipe.execute()
+                break
+
+        except redis.WatchError:
+            continue
+        except redis.exceptions.RedisError:
+            abort(400, DB_ERROR_STR)
+
+    return Response(
+        f"Item: {item_id} added to: {order_id} price updated to: {order_entry.total_cost}",
+        status=200
+    )
 
 
 def rollback_stock(tx_id: str, removed_items: list[tuple[str, int]]):
@@ -343,6 +406,7 @@ def _add_reserved(tx: OrderTxValue, item_id: str, qty: int) -> None:
             tx.reserved_items[i] = (iid, q + qty)
             return
     tx.reserved_items.append((item_id, qty))
+
 
 @app.post('/checkout/<order_id>')
 def checkout(order_id: str):
@@ -383,7 +447,10 @@ def checkout(order_id: str):
             stock_reply = reserve_stock(tx.tx_id, item_id, to_reserve)
             if stock_reply.status_code != 200:
                 # abort whole saga; release anything we reserved so far
-                rollback_stock(tx.tx_id, tx.reserved_items)
+                if not tx.stock_released:
+                    rollback_stock(tx.tx_id, tx.reserved_items)
+                    tx.stock_released = True
+                    _save_tx(tx)
                 tx.state = TX_ABORTED
                 tx.error = f"Out of stock on item_id: {item_id}"
                 _save_tx(tx)
@@ -399,7 +466,10 @@ def checkout(order_id: str):
     if tx.state == TX_STOCK_RESERVED and not tx.payment_done:
         user_reply = charge_user(tx.tx_id, tx.user_id, tx.total_cost)
         if user_reply.status_code != 200:
-            rollback_stock(tx.tx_id, tx.reserved_items)
+            if not tx.stock_released:
+                rollback_stock(tx.tx_id, tx.reserved_items)
+                tx.stock_released = True
+                _save_tx(tx)
             tx.state = TX_ABORTED
             tx.error = "User out of credit"
             _save_tx(tx)
@@ -415,13 +485,29 @@ def checkout(order_id: str):
         try:
             db.set(order_id, msgpack.encode(order_entry))
         except redis.exceptions.RedisError:
-            abort(400, DB_ERROR_STR)
+            # 1) Undo stock if not already undone
+            if not tx.stock_released and tx.reserved_items:
+                rollback_stock(tx.tx_id, tx.reserved_items)
+                tx.stock_released = True
+                _save_tx(tx)
 
+            # 2) Refund payment if not already refunded
+            if tx.payment_done and not tx.payment_refunded:
+                refund_reply = refund_user(tx.tx_id, tx.user_id, tx.total_cost)
+                if refund_reply.status_code == 200:
+                    tx.payment_refunded = True
+
+            # Mark transaction aborted + persist
+            tx.state = TX_ABORTED
+            tx.error = DB_ERROR_STR
+            _save_tx(tx)
+            abort(400, DB_ERROR_STR)
         tx.state = TX_COMPLETED
         _save_tx(tx)
 
     app.logger.debug("Checkout successful")
     return Response("Checkout successful", status=200)
+
 
 if __name__ == '__main__':
     app.run(host="0.0.0.0", port=8000, debug=True)
