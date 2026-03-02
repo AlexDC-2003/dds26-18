@@ -13,7 +13,7 @@ import requests
 from msgspec import msgpack, Struct
 from flask import Flask, jsonify, abort, Response
 from types import SimpleNamespace
-
+from lock_manager import LockManager, LockTimeout, WaitDieAbort, transaction_context
 
 DB_ERROR_STR = "DB error"
 REQ_ERROR_STR = "Requests error"
@@ -27,6 +27,7 @@ db: redis.Redis = redis.Redis(host=os.environ['REDIS_HOST'],
                               password=os.environ['REDIS_PASSWORD'],
                               db=int(os.environ['REDIS_DB']))
 
+lock_manager = LockManager(db=db)
 INTERNAL_TRANSPORT = os.environ.get("INTERNAL_TRANSPORT", "rest")
 KAFKA_TIMEOUT_SEC = float(os.environ.get("KAFKA_REQUEST_TIMEOUT_SEC", "2"))
 
@@ -98,6 +99,10 @@ def _reply_status_code(reply: dict, *, service: str) -> int:
         return 200 if reply["ok"] else 400
     # Fallback
     return 400
+
+def _lock_resources_for_order(order_id: str) -> list[str]:
+    # lock order state + “checkout started” marker
+    return [f"order:{order_id}", f"order_tx:{order_id}"]
 
 def _as_response_like(reply: dict, *, service: str):
     sc = _reply_status_code(reply, service=service)
@@ -349,44 +354,38 @@ def add_item(order_id: str, item_id: str, quantity: int):
         abort(400, f"Item: {item_id} does not exist!")
     item_price = item_reply.json()["price"]
 
-    while True:
-        try:
-            with db.pipeline() as pipe:
-                pipe.watch(order_id)
+    resources = _lock_resources_for_order(order_id)
 
-                raw = pipe.get(order_id)
-                if not raw:
-                    pipe.unwatch()
-                    abort(400, f"Order: {order_id} not found!")
+    try:
+        with transaction_context(lock_manager, resources, ts=time.time()) as txn:
+            raw = db.get(order_id)
+            if not raw:
+                abort(400, f"Order: {order_id} not found!")
 
-                order_entry: OrderValue = msgpack.decode(raw, type=OrderValue)
+            order_entry: OrderValue = msgpack.decode(raw, type=OrderValue)
 
-                if order_entry.paid:
-                    pipe.unwatch()
-                    abort(400, "Order already paid; cannot add items")
+            if order_entry.paid:
+                abort(400, "Order already paid; cannot add items")
 
-                if pipe.get(_order_tx_key(order_id)):
-                    pipe.unwatch()
-                    abort(400, "Checkout already started; cannot add items")
+            if db.get(_order_tx_key(order_id)):
+                abort(400, "Checkout already started; cannot add items")
 
-                order_entry.items.append((item_id, quantity))
-                order_entry.total_cost += quantity * item_price
+            order_entry.items.append((item_id, quantity))
+            order_entry.total_cost += quantity * item_price
 
-                pipe.multi()
-                pipe.set(order_id, msgpack.encode(order_entry))
-                pipe.execute()
-                break
+            db.set(order_id, msgpack.encode(order_entry))
 
-        except redis.WatchError:
-            continue
-        except redis.exceptions.RedisError:
-            abort(400, DB_ERROR_STR)
+    except WaitDieAbort as e:
+        abort(409, f"Transaction aborted (wait-die): {e}")
+    except LockTimeout as e:
+        abort(503, f"Could not acquire lock in time: {e}")
+    except redis.exceptions.RedisError:
+        abort(400, DB_ERROR_STR)
 
     return Response(
         f"Item: {item_id} added to: {order_id} price updated to: {order_entry.total_cost}",
         status=200
     )
-
 
 def rollback_stock(tx_id: str, removed_items: list[tuple[str, int]]):
     for item_id, quantity in removed_items:
@@ -420,93 +419,101 @@ def checkout(order_id: str):
 
     # 1) Get/create tx_id for this order + load/create durable tx record
     tx_id = _get_or_create_tx_id(order_id)
-    tx = _get_or_create_tx_record(tx_id, order_id, order_entry)
+    resources = _lock_resources_for_order(order_id)
+    try:
+        with transaction_context(lock_manager, resources, tx_id=tx_id, ts=time.time()) as txn:
+            tx = _get_or_create_tx_record(tx_id, order_id, order_entry)
 
-    # If tx already finished, behave idempotently
-    if tx.state == TX_COMPLETED:
-        return Response("Checkout successful", status=200)
-    if tx.state == TX_ABORTED:
-        abort(400, tx.error or "Checkout failed")
+            # If tx already finished, behave idempotently
+            if tx.state == TX_COMPLETED:
+                return Response("Checkout successful", status=200)
+            if tx.state == TX_ABORTED:
+                abort(400, tx.error or "Checkout failed")
 
-    # 2) Aggregate quantities per item
-    items_quantities: dict[str, int] = defaultdict(int)
-    for item_id, quantity in tx.items:
-        items_quantities[item_id] += quantity
+            # 2) Aggregate quantities per item
+            items_quantities: dict[str, int] = defaultdict(int)
+            for item_id, quantity in tx.items:
+                items_quantities[item_id] += quantity
 
-    # 3) STOCK step (idempotent):
-    # reserve missing quantities only; persist after each success
-    if tx.state == TX_STARTED:
-        reserved_now = _reserved_as_dict(tx.reserved_items)
+            # 3) STOCK step (idempotent):
+            # reserve missing quantities only; persist after each success
+            if tx.state == TX_STARTED:
+                reserved_now = _reserved_as_dict(tx.reserved_items)
 
-        for item_id, quantity in items_quantities.items():
-            already = reserved_now.get(item_id, 0)
-            if already >= quantity:
-                continue
+                for item_id, quantity in items_quantities.items():
+                    already = reserved_now.get(item_id, 0)
+                    if already >= quantity:
+                        continue
 
-            to_reserve = quantity - already
-            stock_reply = reserve_stock(tx.tx_id, item_id, to_reserve)
-            if stock_reply.status_code != 200:
-                # abort whole saga; release anything we reserved so far
-                if not tx.stock_released:
-                    rollback_stock(tx.tx_id, tx.reserved_items)
-                    tx.stock_released = True
+                    to_reserve = quantity - already
+                    stock_reply = reserve_stock(tx.tx_id, item_id, to_reserve)
+                    if stock_reply.status_code != 200:
+                        # abort whole saga; release anything we reserved so far
+                        if not tx.stock_released:
+                            rollback_stock(tx.tx_id, tx.reserved_items)
+                            tx.stock_released = True
+                            _save_tx(tx)
+                        tx.state = TX_ABORTED
+                        tx.error = f"Out of stock on item_id: {item_id}"
+                        _save_tx(tx)
+                        abort(400, tx.error)
+
+                    _add_reserved(tx, item_id, to_reserve)
+                    _save_tx(tx)  # durable progress
+
+                tx.state = TX_STOCK_RESERVED
+                _save_tx(tx)
+
+            # 4) PAYMENT step (idempotent)
+            if tx.state == TX_STOCK_RESERVED and not tx.payment_done:
+                user_reply = charge_user(tx.tx_id, tx.user_id, tx.total_cost)
+                if user_reply.status_code != 200:
+                    if not tx.stock_released:
+                        rollback_stock(tx.tx_id, tx.reserved_items)
+                        tx.stock_released = True
+                        _save_tx(tx)
+                    tx.state = TX_ABORTED
+                    tx.error = "User out of credit"
                     _save_tx(tx)
-                tx.state = TX_ABORTED
-                tx.error = f"Out of stock on item_id: {item_id}"
-                _save_tx(tx)
-                abort(400, tx.error)
+                    abort(400, tx.error)
 
-            _add_reserved(tx, item_id, to_reserve)
-            _save_tx(tx)  # durable progress
-
-        tx.state = TX_STOCK_RESERVED
-        _save_tx(tx)
-
-    # 4) PAYMENT step (idempotent)
-    if tx.state == TX_STOCK_RESERVED and not tx.payment_done:
-        user_reply = charge_user(tx.tx_id, tx.user_id, tx.total_cost)
-        if user_reply.status_code != 200:
-            if not tx.stock_released:
-                rollback_stock(tx.tx_id, tx.reserved_items)
-                tx.stock_released = True
-                _save_tx(tx)
-            tx.state = TX_ABORTED
-            tx.error = "User out of credit"
-            _save_tx(tx)
-            abort(400, tx.error)
-
-        tx.payment_done = True
-        tx.state = TX_PAYMENT_DONE
-        _save_tx(tx)
-
-    # 5) Finalize order (idempotent-safe)
-    if tx.state == TX_PAYMENT_DONE:
-        order_entry.paid = True
-        try:
-            db.set(order_id, msgpack.encode(order_entry))
-        except redis.exceptions.RedisError:
-            # 1) Undo stock if not already undone
-            if not tx.stock_released and tx.reserved_items:
-                rollback_stock(tx.tx_id, tx.reserved_items)
-                tx.stock_released = True
+                tx.payment_done = True
+                tx.state = TX_PAYMENT_DONE
                 _save_tx(tx)
 
-            # 2) Refund payment if not already refunded
-            if tx.payment_done and not tx.payment_refunded:
-                refund_reply = refund_user(tx.tx_id, tx.user_id, tx.total_cost)
-                if refund_reply.status_code == 200:
-                    tx.payment_refunded = True
+            # 5) Finalize order (idempotent-safe)
+            if tx.state == TX_PAYMENT_DONE:
+                order_entry.paid = True
+                try:
+                    db.set(order_id, msgpack.encode(order_entry))
+                except redis.exceptions.RedisError:
+                    # 1) Undo stock if not already undone
+                    if not tx.stock_released and tx.reserved_items:
+                        rollback_stock(tx.tx_id, tx.reserved_items)
+                        tx.stock_released = True
+                        _save_tx(tx)
 
-            # Mark transaction aborted + persist
-            tx.state = TX_ABORTED
-            tx.error = DB_ERROR_STR
-            _save_tx(tx)
-            abort(400, DB_ERROR_STR)
-        tx.state = TX_COMPLETED
-        _save_tx(tx)
+                    # 2) Refund payment if not already refunded
+                    if tx.payment_done and not tx.payment_refunded:
+                        refund_reply = refund_user(tx.tx_id, tx.user_id, tx.total_cost)
+                        if refund_reply.status_code == 200:
+                            tx.payment_refunded = True
 
-    app.logger.debug("Checkout successful")
-    return Response("Checkout successful", status=200)
+                    # Mark transaction aborted + persist
+                    tx.state = TX_ABORTED
+                    tx.error = DB_ERROR_STR
+                    _save_tx(tx)
+                    abort(400, DB_ERROR_STR)
+                tx.state = TX_COMPLETED
+                _save_tx(tx)
+
+            app.logger.debug("Checkout successful")
+            return Response("Checkout successful", status=200)
+    except WaitDieAbort as e:
+        abort(409, f"Transaction aborted (wait-die): {e}")
+    except LockTimeout as e:
+        abort(503, f"Could not acquire lock in time: {e}")
+
 
 
 if __name__ == '__main__':
