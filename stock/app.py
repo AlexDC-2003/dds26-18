@@ -1,117 +1,82 @@
-import logging
+from flask import Flask, jsonify
+import redis
 import os
-import atexit
 import uuid
 
-import redis
+from kafka_infra import StockKafkaInfrastructure
+from saga_dispatcher import stock_dispatcher, set_redis_client
+import lock_manager
 
-from msgspec import msgpack, Struct
-from flask import Flask, jsonify, abort, Response
+app = Flask(__name__)
 
+redis_client = redis.Redis(
+    host=os.environ["REDIS_HOST"],
+    port=int(os.environ["REDIS_PORT"]),
+    password=os.environ["REDIS_PASSWORD"],
+    db=int(os.environ["REDIS_DB"]),
+    decode_responses=True
+)
 
-DB_ERROR_STR = "DB error"
+set_redis_client(redis_client)
+lock_manager.set_redis_client(redis_client)  # shared redis into lock manager
 
-app = Flask("stock-service")
+kafka_infra = StockKafkaInfrastructure(dispatcher=stock_dispatcher)
 
-db: redis.Redis = redis.Redis(host=os.environ['REDIS_HOST'],
-                              port=int(os.environ['REDIS_PORT']),
-                              password=os.environ['REDIS_PASSWORD'],
-                              db=int(os.environ['REDIS_DB']))
-
-
-def close_db_connection():
-    db.close()
-
-
-atexit.register(close_db_connection)
-
-
-class StockValue(Struct):
-    stock: int
-    price: int
-
-
-def get_item_from_db(item_id: str) -> StockValue | None:
-    # get serialized data
-    try:
-        entry: bytes = db.get(item_id)
-    except redis.exceptions.RedisError:
-        return abort(400, DB_ERROR_STR)
-    # deserialize data if it exists else return null
-    entry: StockValue | None = msgpack.decode(entry, type=StockValue) if entry else None
-    if entry is None:
-        # if item does not exist in the database; abort
-        abort(400, f"Item: {item_id} not found!")
-    return entry
+kafka_infra.start()
+@app.route("/item/create/<price>", methods=["POST"])
+def create_item(price):
+    item_id = str(uuid.uuid4())
+    redis_client.hset(f"item:{item_id}", mapping={
+        "stock": 0,
+        "price": price
+    })
+    return jsonify({"item_id": item_id}), 200
 
 
-@app.post('/item/create/<price>')
-def create_item(price: int):
-    key = str(uuid.uuid4())
-    app.logger.debug(f"Item: {key} created")
-    value = msgpack.encode(StockValue(stock=0, price=int(price)))
-    try:
-        db.set(key, value)
-    except redis.exceptions.RedisError:
-        return abort(400, DB_ERROR_STR)
-    return jsonify({'item_id': key})
+@app.route("/find/<item_id>", methods=["GET"])
+def find_item(item_id):
+    item = redis_client.hgetall(f"item:{item_id}")
+    if not item:
+        return jsonify({"error": "Item not found"}), 400
+
+    return jsonify({
+        "stock": int(item["stock"]),
+        "price": float(item["price"])
+    }), 200
 
 
-@app.post('/batch_init/<n>/<starting_stock>/<item_price>')
-def batch_init_users(n: int, starting_stock: int, item_price: int):
-    n = int(n)
-    starting_stock = int(starting_stock)
-    item_price = int(item_price)
-    kv_pairs: dict[str, bytes] = {f"{i}": msgpack.encode(StockValue(stock=starting_stock, price=item_price))
-                                  for i in range(n)}
-    try:
-        db.mset(kv_pairs)
-    except redis.exceptions.RedisError:
-        return abort(400, DB_ERROR_STR)
-    return jsonify({"msg": "Batch init for stock successful"})
+@app.route("/add/<item_id>/<amount>", methods=["POST"])
+def add_stock(item_id, amount):
+    key = f"item:{item_id}"
+    if not redis_client.exists(key):
+        return jsonify({"error": "Item not found"}), 400
+
+    redis_client.hincrby(key, "stock", int(amount))
+    return jsonify({"done": True}), 200
 
 
-@app.get('/find/<item_id>')
-def find_item(item_id: str):
-    item_entry: StockValue = get_item_from_db(item_id)
-    return jsonify(
-        {
-            "stock": item_entry.stock,
-            "price": item_entry.price
-        }
-    )
+@app.route("/subtract/<item_id>/<amount>", methods=["POST"])
+def subtract_stock(item_id, amount):
+    key = f"item:{item_id}"
+
+    if not redis_client.exists(key):
+        return jsonify({"error": "Item not found"}), 400
+
+    with redis_client.pipeline() as pipe:
+        while True:
+            try:
+                pipe.watch(key)
+                current_stock = int(pipe.hget(key, "stock"))
+                if current_stock < int(amount):
+                    pipe.unwatch()
+                    return jsonify({"error": "Insufficient stock"}), 400
+                pipe.multi()
+                pipe.hincrby(key, "stock", -int(amount))
+                pipe.execute()
+                break
+            except redis.WatchError:
+                continue
 
 
-@app.post('/add/<item_id>/<amount>')
-def add_stock(item_id: str, amount: int):
-    item_entry: StockValue = get_item_from_db(item_id)
-    # update stock, serialize and update database
-    item_entry.stock += int(amount)
-    try:
-        db.set(item_id, msgpack.encode(item_entry))
-    except redis.exceptions.RedisError:
-        return abort(400, DB_ERROR_STR)
-    return Response(f"Item: {item_id} stock updated to: {item_entry.stock}", status=200)
-
-
-@app.post('/subtract/<item_id>/<amount>')
-def remove_stock(item_id: str, amount: int):
-    item_entry: StockValue = get_item_from_db(item_id)
-    # update stock, serialize and update database
-    item_entry.stock -= int(amount)
-    app.logger.debug(f"Item: {item_id} stock updated to: {item_entry.stock}")
-    if item_entry.stock < 0:
-        abort(400, f"Item: {item_id} stock cannot get reduced below zero!")
-    try:
-        db.set(item_id, msgpack.encode(item_entry))
-    except redis.exceptions.RedisError:
-        return abort(400, DB_ERROR_STR)
-    return Response(f"Item: {item_id} stock updated to: {item_entry.stock}", status=200)
-
-
-if __name__ == '__main__':
-    app.run(host="0.0.0.0", port=8000, debug=True)
-else:
-    gunicorn_logger = logging.getLogger('gunicorn.error')
-    app.logger.handlers = gunicorn_logger.handlers
-    app.logger.setLevel(gunicorn_logger.level)
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=8000)

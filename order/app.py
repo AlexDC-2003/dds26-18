@@ -47,7 +47,7 @@ class OrderValue(Struct):
     paid: bool
     items: list[tuple[str, int]]
     user_id: str
-    total_cost: int
+    total_cost: float
 
 # Saga transaction storage
 
@@ -66,7 +66,7 @@ class OrderTxValue(Struct):
     tx_id: str
     order_id: str
     user_id: str
-    total_cost: int
+    total_cost: float
 
     # snapshot of what we intended to buy (helps idempotency / debugging)
     items: list[tuple[str, int]]
