@@ -4,23 +4,25 @@ import atexit
 import random
 import uuid
 import time
-from kafka_bus import KafkaBus
-from collections import defaultdict
-
 import redis
 import requests
-
+import asyncio
+from kafka_bus import KafkaBus
+from collections import defaultdict
+from lock_manager import Transaction, LockManager, LockTimeout, WaitDieAbort
 from msgspec import msgpack, Struct
-from flask import Flask, jsonify, abort, Response
 from types import SimpleNamespace
-from lock_manager import LockManager, LockTimeout, WaitDieAbort, transaction_context
+from contextlib import asynccontextmanager
+from quart import Quart, jsonify, abort, Response
+
+
+app = Quart("order-service")
 
 DB_ERROR_STR = "DB error"
 REQ_ERROR_STR = "Requests error"
 
 GATEWAY_URL = os.environ['GATEWAY_URL']
 
-app = Flask("order-service")
 
 db: redis.Redis = redis.Redis(host=os.environ['REDIS_HOST'],
                               port=int(os.environ['REDIS_PORT']),
@@ -33,15 +35,37 @@ KAFKA_TIMEOUT_SEC = float(os.environ.get("KAFKA_REQUEST_TIMEOUT_SEC", "2"))
 
 kafka_bus = KafkaBus()
 
-if INTERNAL_TRANSPORT == "kafka":
-    kafka_bus.start()
-    atexit.register(kafka_bus.stop)
+async def rget(key: str):
+    return await asyncio.to_thread(db.get, key)
 
-def close_db_connection():
-    db.close()
+async def rset(key: str, value: bytes, **kwargs):
+    return await asyncio.to_thread(db.set, key, value, **kwargs)
+
+async def rmset(mapping: dict[str, bytes]):
+    return await asyncio.to_thread(db.mset, mapping)
+
+async def rclose():
+    return await asyncio.to_thread(db.close)
+
+async def http_get(url: str):
+    return await asyncio.to_thread(send_get_request, url)
+
+async def http_post(url: str):
+    return await asyncio.to_thread(send_post_request, url)
+
+@app.before_serving
+async def startup():
+    if INTERNAL_TRANSPORT == "kafka":
+        await kafka_bus.start()
+
+@app.after_serving
+async def shutdown():
+    if INTERNAL_TRANSPORT == "kafka":
+        await kafka_bus.stop()
+    await asyncio.to_thread(db.close)
 
 
-atexit.register(close_db_connection)
+
 
 
 class OrderValue(Struct):
@@ -100,6 +124,17 @@ def _reply_status_code(reply: dict, *, service: str) -> int:
     # Fallback
     return 400
 
+
+@asynccontextmanager
+async def async_2pl(resources: list[str], *, tx_id: str | None = None, ts: float | None = None):
+    txn = Transaction(tx_id=tx_id, ts=ts)
+    for r in sorted(set(resources)):
+        await asyncio.to_thread(lock_manager.acquire, txn, r)
+    try:
+        yield txn
+    finally:
+        await asyncio.to_thread(lock_manager.release_all, txn)
+
 def _lock_resources_for_order(order_id: str) -> list[str]:
     # lock order state + “checkout started” marker
     return [f"order:{order_id}", f"order_tx:{order_id}"]
@@ -113,18 +148,16 @@ def _as_response_like(reply: dict, *, service: str):
         json=lambda: reply.get("payload", reply)
     )
 
-def get_order_from_db(order_id: str) -> OrderValue | None:
+async def get_order_from_db(order_id: str) -> OrderValue:
     try:
-        # get serialized data
-        entry: bytes = db.get(order_id)
+        entry: bytes | None = await rget(order_id)
     except redis.exceptions.RedisError:
-        return abort(400, DB_ERROR_STR)
-    # deserialize data if it exists else return null
-    entry: OrderValue | None = msgpack.decode(entry, type=OrderValue) if entry else None
-    if entry is None:
-        # if order does not exist in the database; abort
+        abort(400, DB_ERROR_STR)
+
+    order: OrderValue | None = msgpack.decode(entry, type=OrderValue) if entry else None
+    if order is None:
         abort(400, f"Order: {order_id} not found!")
-    return entry
+    return order
 
 def _order_tx_key(order_id: str) -> str:
     return f"{ORDER_TX_KEY_PREFIX}{order_id}"
@@ -134,13 +167,9 @@ def _tx_key(tx_id: str) -> str:
     return f"{TX_KEY_PREFIX}{tx_id}"
 
 
-def _get_or_create_tx_id(order_id: str) -> str:
-    """
-    Idempotency anchor:
-    Ensures every order_id gets exactly one tx_id (even if /checkout is called multiple times).
-    """
+async def _get_or_create_tx_id(order_id: str) -> str:
     try:
-        existing = db.get(_order_tx_key(order_id))
+        existing = await rget(_order_tx_key(order_id))
     except redis.exceptions.RedisError:
         abort(400, DB_ERROR_STR)
 
@@ -149,45 +178,39 @@ def _get_or_create_tx_id(order_id: str) -> str:
 
     new_tx_id = str(uuid.uuid4())
     try:
-        # NX = only set if not exists (prevents two concurrent checkouts creating two tx_ids)
-        ok = db.set(_order_tx_key(order_id), new_tx_id, nx=True)
+        ok = await rset(_order_tx_key(order_id), new_tx_id, nx=True)
     except redis.exceptions.RedisError:
         abort(400, DB_ERROR_STR)
 
     if ok:
         return new_tx_id
 
-    # someone else set it between our GET and SET NX; read it now
     try:
-        existing2 = db.get(_order_tx_key(order_id))
+        existing2 = await rget(_order_tx_key(order_id))
     except redis.exceptions.RedisError:
         abort(400, DB_ERROR_STR)
 
     return existing2.decode() if existing2 else new_tx_id
 
 
-def _get_tx(tx_id: str) -> OrderTxValue | None:
+async def _get_tx(tx_id: str) -> OrderTxValue | None:
     try:
-        raw = db.get(_tx_key(tx_id))
+        raw = await rget(_tx_key(tx_id))
     except redis.exceptions.RedisError:
         abort(400, DB_ERROR_STR)
     return msgpack.decode(raw, type=OrderTxValue) if raw else None
 
 
-def _save_tx(tx: OrderTxValue) -> None:
+async def _save_tx(tx: OrderTxValue) -> None:
     tx.updated_at = time.time()
     try:
-        db.set(_tx_key(tx.tx_id), msgpack.encode(tx))
+        await rset(_tx_key(tx.tx_id), msgpack.encode(tx))
     except redis.exceptions.RedisError:
         abort(400, DB_ERROR_STR)
 
 
-def _get_or_create_tx_record(tx_id: str, order_id: str, order_entry: OrderValue) -> OrderTxValue:
-    """
-    Durable tx record creator.
-    If record exists, returns it; otherwise creates STARTED record.
-    """
-    existing = _get_tx(tx_id)
+async def _get_or_create_tx_record(tx_id: str, order_id: str, order_entry: OrderValue) -> OrderTxValue:
+    existing = await _get_tx(tx_id)
     if existing:
         return existing
 
@@ -201,36 +224,35 @@ def _get_or_create_tx_record(tx_id: str, order_id: str, order_entry: OrderValue)
         state=TX_STARTED,
         reserved_items=[],
         payment_done=False,
+        payment_refunded=False,
+        stock_released=False,
         created_at=now,
         updated_at=now,
         error=None,
-        payment_refunded=False,
-        stock_released=False,
     )
 
-    # try to create only if missing (helps if two requests race)
     try:
-        db.set(_tx_key(tx_id), msgpack.encode(tx), nx=True)
+        ok = await rset(_tx_key(tx_id), msgpack.encode(tx), nx=True)
     except redis.exceptions.RedisError:
         abort(400, DB_ERROR_STR)
 
-    # if NX failed because someone else created it, read back
-    return _get_tx(tx_id) or tx
+    if ok:
+        return tx
+    return (await _get_tx(tx_id)) or tx
 
 @app.post('/create/<user_id>')
-def create_order(user_id: str):
+async def create_order(user_id: str):
     key = str(uuid.uuid4())
     value = msgpack.encode(OrderValue(paid=False, items=[], user_id=user_id, total_cost=0))
     try:
-        db.set(key, value)
+        await rset(key, value)
     except redis.exceptions.RedisError:
-        return abort(400, DB_ERROR_STR)
+        abort(400, DB_ERROR_STR)
     return jsonify({'order_id': key})
 
 
 @app.post('/batch_init/<n>/<n_items>/<n_users>/<item_price>')
-def batch_init_users(n: int, n_items: int, n_users: int, item_price: int):
-
+async def batch_init_users(n: int, n_items: int, n_users: int, item_price: int):
     n = int(n)
     n_items = int(n_items)
     n_users = int(n_users)
@@ -240,55 +262,48 @@ def batch_init_users(n: int, n_items: int, n_users: int, item_price: int):
         user_id = random.randint(0, n_users - 1)
         item1_id = random.randint(0, n_items - 1)
         item2_id = random.randint(0, n_items - 1)
-        value = OrderValue(paid=False,
-                           items=[(f"{item1_id}", 1), (f"{item2_id}", 1)],
-                           user_id=f"{user_id}",
-                           total_cost=2*item_price)
-        return value
+        return OrderValue(
+            paid=False,
+            items=[(f"{item1_id}", 1), (f"{item2_id}", 1)],
+            user_id=f"{user_id}",
+            total_cost=2 * item_price,
+        )
 
-    kv_pairs: dict[str, bytes] = {f"{i}": msgpack.encode(generate_entry())
-                                  for i in range(n)}
+    kv_pairs: dict[str, bytes] = {f"{i}": msgpack.encode(generate_entry()) for i in range(n)}
     try:
-        db.mset(kv_pairs)
+        await rmset(kv_pairs)  # <-- changed
     except redis.exceptions.RedisError:
-        return abort(400, DB_ERROR_STR)
+        abort(400, DB_ERROR_STR)
+
     return jsonify({"msg": "Batch init for orders successful"})
 
-
 @app.get('/find/<order_id>')
-def find_order(order_id: str):
-    order_entry: OrderValue = get_order_from_db(order_id)
+async def find_order(order_id: str):
+    order_entry: OrderValue = await get_order_from_db(order_id)
     return jsonify(
         {
             "order_id": order_id,
             "paid": order_entry.paid,
             "items": order_entry.items,
             "user_id": order_entry.user_id,
-            "total_cost": order_entry.total_cost
+            "total_cost": order_entry.total_cost,
         }
     )
-
-
 def send_post_request(url: str):
     try:
-        response = requests.post(url, timeout=3)
-    except requests.exceptions.RequestException:
-        abort(400, REQ_ERROR_STR)
-    else:
-        return response
-
+        return requests.post(url, timeout=3)
+    except requests.exceptions.RequestException as e:
+        raise RuntimeError(REQ_ERROR_STR) from e
 
 def send_get_request(url: str):
     try:
-        response = requests.get(url, timeout=3)
-    except requests.exceptions.RequestException:
-        abort(400, REQ_ERROR_STR)
-    else:
-        return response
+        return requests.get(url, timeout=3)
+    except requests.exceptions.RequestException as e:
+        raise RuntimeError(REQ_ERROR_STR) from e
 
-def reserve_stock(tx_id: str, item_id: str, quantity: int):
+async def reserve_stock(tx_id: str, item_id: str, quantity: int):
     if INTERNAL_TRANSPORT != "kafka":
-        return send_post_request(f"{GATEWAY_URL}/stock/subtract/{item_id}/{quantity}")
+        return await http_post(f"{GATEWAY_URL}/stock/subtract/{item_id}/{quantity}")
 
     cmd = {
         "msg_id": str(uuid.uuid4()),
@@ -296,16 +311,12 @@ def reserve_stock(tx_id: str, item_id: str, quantity: int):
         "type": "reserve_stock",
         "payload": {"item_id": item_id, "quantity": quantity},
     }
-    reply = kafka_bus.request(
-        os.environ["KAFKA_STOCK_COMMANDS_TOPIC"], cmd, timeout_sec=KAFKA_TIMEOUT_SEC
-    )
-
+    reply = await kafka_bus.request(os.environ["KAFKA_STOCK_COMMANDS_TOPIC"], cmd, timeout_sec=KAFKA_TIMEOUT_SEC)
     return _as_response_like(reply, service="stock")
 
-
-def release_stock(tx_id: str, item_id: str, quantity: int):
+async def release_stock(tx_id: str, item_id: str, quantity: int):
     if INTERNAL_TRANSPORT != "kafka":
-        return send_post_request(f"{GATEWAY_URL}/stock/add/{item_id}/{quantity}")
+        return await http_post(f"{GATEWAY_URL}/stock/add/{item_id}/{quantity}")
 
     cmd = {
         "msg_id": str(uuid.uuid4()),
@@ -313,15 +324,12 @@ def release_stock(tx_id: str, item_id: str, quantity: int):
         "type": "release_stock",
         "payload": {"item_id": item_id, "quantity": quantity},
     }
-    reply = kafka_bus.request(
-        os.environ["KAFKA_STOCK_COMMANDS_TOPIC"], cmd, timeout_sec=KAFKA_TIMEOUT_SEC
-    )
+    reply = await kafka_bus.request(os.environ["KAFKA_STOCK_COMMANDS_TOPIC"], cmd, timeout_sec=KAFKA_TIMEOUT_SEC)
     return _as_response_like(reply, service="stock")
 
-
-def charge_user(tx_id: str, user_id: str, amount: int):
+async def charge_user(tx_id: str, user_id: str, amount: int | float):
     if INTERNAL_TRANSPORT != "kafka":
-        return send_post_request(f"{GATEWAY_URL}/payment/pay/{user_id}/{amount}")
+        return await http_post(f"{GATEWAY_URL}/payment/pay/{user_id}/{amount}")
 
     cmd = {
         "msg_id": str(uuid.uuid4()),
@@ -329,36 +337,42 @@ def charge_user(tx_id: str, user_id: str, amount: int):
         "type": "charge_user",
         "payload": {"user_id": user_id, "amount": amount},
     }
-
-    reply = kafka_bus.request(os.environ["KAFKA_PAYMENT_COMMANDS_TOPIC"], cmd, timeout_sec=KAFKA_TIMEOUT_SEC)
+    reply = await kafka_bus.request(os.environ["KAFKA_PAYMENT_COMMANDS_TOPIC"], cmd, timeout_sec=KAFKA_TIMEOUT_SEC)
     return _as_response_like(reply, service="payment")
 
-def refund_user(tx_id: str, user_id: str, amount: int):
+async def refund_user(tx_id: str, user_id: str, amount: int | float):
     if INTERNAL_TRANSPORT != "kafka":
-        return send_post_request(f"{GATEWAY_URL}/payment/add_funds/{user_id}/{amount}")
+        return await http_post(f"{GATEWAY_URL}/payment/add_funds/{user_id}/{amount}")
 
     cmd = {
         "msg_id": str(uuid.uuid4()),
         "tx_id": tx_id,
-        "type": "refund_user",  # matches PaymentKafkaWorker
+        "type": "refund_user",
         "payload": {"user_id": user_id, "amount": amount},
     }
-    reply = kafka_bus.request(os.environ["KAFKA_PAYMENT_COMMANDS_TOPIC"], cmd, timeout_sec=KAFKA_TIMEOUT_SEC)
+    reply = await kafka_bus.request(os.environ["KAFKA_PAYMENT_COMMANDS_TOPIC"], cmd, timeout_sec=KAFKA_TIMEOUT_SEC)
     return _as_response_like(reply, service="payment")
 
+
 @app.post('/addItem/<order_id>/<item_id>/<quantity>')
-def add_item(order_id: str, item_id: str, quantity: int):
+async def add_item(order_id: str, item_id: str, quantity: int):
     quantity = int(quantity)
-    item_reply = send_get_request(f"{GATEWAY_URL}/stock/find/{item_id}")
+
+    try:
+        item_reply = await http_get(f"{GATEWAY_URL}/stock/find/{item_id}")
+    except Exception:
+        abort(400, REQ_ERROR_STR)
+
     if item_reply.status_code != 200:
         abort(400, f"Item: {item_id} does not exist!")
+
     item_price = item_reply.json()["price"]
 
     resources = _lock_resources_for_order(order_id)
 
     try:
-        with transaction_context(lock_manager, resources, ts=time.time()) as txn:
-            raw = db.get(order_id)
+        async with async_2pl(resources, ts=time.time()):
+            raw = await rget(order_id)
             if not raw:
                 abort(400, f"Order: {order_id} not found!")
 
@@ -366,14 +380,14 @@ def add_item(order_id: str, item_id: str, quantity: int):
 
             if order_entry.paid:
                 abort(400, "Order already paid; cannot add items")
-
-            if db.get(_order_tx_key(order_id)):
+            started = await rget(_order_tx_key(order_id))
+            if started:
                 abort(400, "Checkout already started; cannot add items")
 
             order_entry.items.append((item_id, quantity))
             order_entry.total_cost += quantity * item_price
 
-            db.set(order_id, msgpack.encode(order_entry))
+            await rset(order_id, msgpack.encode(order_entry))
 
     except WaitDieAbort as e:
         abort(409, f"Transaction aborted (wait-die): {e}")
@@ -384,12 +398,12 @@ def add_item(order_id: str, item_id: str, quantity: int):
 
     return Response(
         f"Item: {item_id} added to: {order_id} price updated to: {order_entry.total_cost}",
-        status=200
+        status=200,
     )
 
-def rollback_stock(tx_id: str, removed_items: list[tuple[str, int]]):
+async def rollback_stock(tx_id: str, removed_items: list[tuple[str, int]]):
     for item_id, quantity in removed_items:
-        release_stock(tx_id, item_id, quantity)
+        await release_stock(tx_id, item_id, quantity)
 
 def _reserved_as_dict(reserved_items: list[tuple[str, int]]) -> dict[str, int]:
     d: dict[str, int] = defaultdict(int)
@@ -408,35 +422,29 @@ def _add_reserved(tx: OrderTxValue, item_id: str, qty: int) -> None:
 
 
 @app.post('/checkout/<order_id>')
-def checkout(order_id: str):
-    app.logger.debug(f"Checking out {order_id}")
+async def checkout(order_id: str):
+    order_entry: OrderValue = await get_order_from_db(order_id)
 
-    order_entry: OrderValue = get_order_from_db(order_id)
-
-    # Idempotency shortcut: if already paid, do nothing
     if order_entry.paid:
         return Response("Checkout successful", status=200)
 
-    # 1) Get/create tx_id for this order + load/create durable tx record
-    tx_id = _get_or_create_tx_id(order_id)
+    tx_id = await _get_or_create_tx_id(order_id)
     resources = _lock_resources_for_order(order_id)
-    try:
-        with transaction_context(lock_manager, resources, tx_id=tx_id, ts=time.time()) as txn:
-            tx = _get_or_create_tx_record(tx_id, order_id, order_entry)
 
-            # If tx already finished, behave idempotently
+    try:
+        # Acquire locks first (2PL discipline)
+        async with async_2pl(resources, tx_id=tx_id, ts=None):
+            # Create/read tx inside lock
+            tx = await _get_or_create_tx_record(tx_id, order_id, order_entry)
             if tx.state == TX_COMPLETED:
                 return Response("Checkout successful", status=200)
             if tx.state == TX_ABORTED:
                 abort(400, tx.error or "Checkout failed")
 
-            # 2) Aggregate quantities per item
             items_quantities: dict[str, int] = defaultdict(int)
             for item_id, quantity in tx.items:
                 items_quantities[item_id] += quantity
 
-            # 3) STOCK step (idempotent):
-            # reserve missing quantities only; persist after each success
             if tx.state == TX_STARTED:
                 reserved_now = _reserved_as_dict(tx.reserved_items)
 
@@ -446,79 +454,75 @@ def checkout(order_id: str):
                         continue
 
                     to_reserve = quantity - already
-                    stock_reply = reserve_stock(tx.tx_id, item_id, to_reserve)
+                    stock_reply = await reserve_stock(tx.tx_id, item_id, to_reserve)
                     if stock_reply.status_code != 200:
-                        # abort whole saga; release anything we reserved so far
                         if not tx.stock_released:
-                            rollback_stock(tx.tx_id, tx.reserved_items)
+                            await rollback_stock(tx.tx_id, tx.reserved_items)
                             tx.stock_released = True
-                            _save_tx(tx)
+                            await _save_tx(tx)
+
                         tx.state = TX_ABORTED
                         tx.error = f"Out of stock on item_id: {item_id}"
-                        _save_tx(tx)
+                        await _save_tx(tx)
                         abort(400, tx.error)
 
                     _add_reserved(tx, item_id, to_reserve)
-                    _save_tx(tx)  # durable progress
+                    await _save_tx(tx)
 
                 tx.state = TX_STOCK_RESERVED
-                _save_tx(tx)
+                await _save_tx(tx)
 
-            # 4) PAYMENT step (idempotent)
             if tx.state == TX_STOCK_RESERVED and not tx.payment_done:
-                user_reply = charge_user(tx.tx_id, tx.user_id, tx.total_cost)
+                user_reply = await charge_user(tx.tx_id, tx.user_id, tx.total_cost)
                 if user_reply.status_code != 200:
                     if not tx.stock_released:
-                        rollback_stock(tx.tx_id, tx.reserved_items)
+                        await rollback_stock(tx.tx_id, tx.reserved_items)
                         tx.stock_released = True
-                        _save_tx(tx)
+                        await _save_tx(tx)
+
                     tx.state = TX_ABORTED
                     tx.error = "User out of credit"
-                    _save_tx(tx)
+                    await _save_tx(tx)
                     abort(400, tx.error)
 
                 tx.payment_done = True
                 tx.state = TX_PAYMENT_DONE
-                _save_tx(tx)
+                await _save_tx(tx)
 
-            # 5) Finalize order (idempotent-safe)
             if tx.state == TX_PAYMENT_DONE:
+                # optionally re-read order under lock
+                order_entry = await get_order_from_db(order_id)
                 order_entry.paid = True
-                try:
-                    db.set(order_id, msgpack.encode(order_entry))
-                except redis.exceptions.RedisError:
-                    # 1) Undo stock if not already undone
-                    if not tx.stock_released and tx.reserved_items:
-                        rollback_stock(tx.tx_id, tx.reserved_items)
-                        tx.stock_released = True
-                        _save_tx(tx)
 
-                    # 2) Refund payment if not already refunded
+                try:
+                    await rset(order_id, msgpack.encode(order_entry))
+                except redis.exceptions.RedisError:
+                    if not tx.stock_released and tx.reserved_items:
+                        await rollback_stock(tx.tx_id, tx.reserved_items)
+                        tx.stock_released = True
+                        await _save_tx(tx)
+
                     if tx.payment_done and not tx.payment_refunded:
-                        refund_reply = refund_user(tx.tx_id, tx.user_id, tx.total_cost)
+                        refund_reply = await refund_user(tx.tx_id, tx.user_id, tx.total_cost)
                         if refund_reply.status_code == 200:
                             tx.payment_refunded = True
 
-                    # Mark transaction aborted + persist
                     tx.state = TX_ABORTED
                     tx.error = DB_ERROR_STR
-                    _save_tx(tx)
+                    await _save_tx(tx)
                     abort(400, DB_ERROR_STR)
-                tx.state = TX_COMPLETED
-                _save_tx(tx)
 
-            app.logger.debug("Checkout successful")
+                tx.state = TX_COMPLETED
+                await _save_tx(tx)
+
             return Response("Checkout successful", status=200)
+
     except WaitDieAbort as e:
         abort(409, f"Transaction aborted (wait-die): {e}")
     except LockTimeout as e:
         abort(503, f"Could not acquire lock in time: {e}")
 
-
-
 if __name__ == '__main__':
     app.run(host="0.0.0.0", port=8000, debug=True)
 else:
-    gunicorn_logger = logging.getLogger('gunicorn.error')
-    app.logger.handlers = gunicorn_logger.handlers
-    app.logger.setLevel(gunicorn_logger.level)
+    logging.basicConfig(level=logging.INFO)
