@@ -76,6 +76,7 @@ def subtract_stock(item_id, amount):
                 break
             except redis.WatchError:
                 continue
+    return jsonify({"done": True}), 200
 
 
 if __name__ == "__main__":
