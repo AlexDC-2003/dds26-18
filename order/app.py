@@ -382,7 +382,11 @@ async def add_item(order_id: str, item_id: str, quantity: int):
                 abort(400, "Order already paid; cannot add items")
             started = await rget(_order_tx_key(order_id))
             if started:
-                abort(400, "Checkout already started; cannot add items")
+                existing = await _get_tx(started.decode())
+                if existing and existing.state == TX_COMPLETED:
+                    abort(400, "Checkout already paid and completed; cannot add items")
+                elif existing and existing.state != TX_ABORTED:
+                    abort(400, "Checkout already in progress; cannot add items")
 
             order_entry.items.append((item_id, quantity))
             order_entry.total_cost += quantity * item_price
@@ -423,23 +427,39 @@ def _add_reserved(tx: OrderTxValue, item_id: str, qty: int) -> None:
 
 @app.post('/checkout/<order_id>')
 async def checkout(order_id: str):
-    order_entry: OrderValue = await get_order_from_db(order_id)
-
-    if order_entry.paid:
-        return Response("Checkout successful", status=200)
-
-    tx_id = await _get_or_create_tx_id(order_id)
     resources = _lock_resources_for_order(order_id)
 
     try:
         # Acquire locks first (2PL discipline)
-        async with async_2pl(resources, tx_id=tx_id, ts=None):
+        async with async_2pl(resources, tx_id=None, ts=None):
             # Create/read tx inside lock
+            order_entry: OrderValue = await get_order_from_db(order_id)
+
+            if order_entry.paid:
+                return Response("Checkout successful", status=200)
+
+            tx_id = await _get_or_create_tx_id(order_id)
             tx = await _get_or_create_tx_record(tx_id, order_id, order_entry)
             if tx.state == TX_COMPLETED:
                 return Response("Checkout successful", status=200)
             if tx.state == TX_ABORTED:
-                abort(400, tx.error or "Checkout failed")
+                now = time.time()
+                tx = OrderTxValue(
+                    tx_id=tx_id,
+                    order_id=order_id,
+                    user_id=order_entry.user_id,
+                    total_cost=order_entry.total_cost,
+                    items=list(order_entry.items),
+                    state=TX_STARTED,
+                    reserved_items=[],
+                    payment_done=False,
+                    payment_refunded=False,
+                    stock_released=False,
+                    created_at=now,
+                    updated_at=now,
+                    error=None,
+                )
+                await _save_tx(tx)
 
             items_quantities: dict[str, int] = defaultdict(int)
             for item_id, quantity in tx.items:
