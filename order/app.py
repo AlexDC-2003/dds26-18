@@ -405,9 +405,17 @@ async def add_item(order_id: str, item_id: str, quantity: int):
         status=200,
     )
 
-async def rollback_stock(tx_id: str, removed_items: list[tuple[str, int]]):
-    for item_id, quantity in removed_items:
-        await release_stock(tx_id, item_id, quantity)
+async def rollback_stock(tx: OrderTxValue) -> None:
+    still_reserved = list(tx.reserved_items)
+    for item_id, quantity in still_reserved:
+        try:
+            reply = await release_stock(tx.tx_id, item_id, quantity)
+            if reply.status_code == 200:
+                tx.reserved_items = [(i, q) for i, q in tx.reserved_items if i != item_id]
+                await _save_tx(tx)
+        except Exception:
+            pass
+        # sunt de acord
 
 def _reserved_as_dict(reserved_items: list[tuple[str, int]]) -> dict[str, int]:
     d: dict[str, int] = defaultdict(int)
@@ -427,18 +435,18 @@ def _add_reserved(tx: OrderTxValue, item_id: str, qty: int) -> None:
 
 @app.post('/checkout/<order_id>')
 async def checkout(order_id: str):
+    order_entry: OrderValue = await get_order_from_db(order_id)
+    if order_entry.paid:
+        return Response("Checkout successful", status=200)
+
+    tx_id = await _get_or_create_tx_id(order_id)
     resources = _lock_resources_for_order(order_id)
 
     try:
         # Acquire locks first (2PL discipline)
-        async with async_2pl(resources, tx_id=None, ts=None):
+        async with async_2pl(resources, tx_id=tx_id, ts=None):
             # Create/read tx inside lock
-            order_entry: OrderValue = await get_order_from_db(order_id)
-
-            if order_entry.paid:
-                return Response("Checkout successful", status=200)
-
-            tx_id = await _get_or_create_tx_id(order_id)
+            
             tx = await _get_or_create_tx_record(tx_id, order_id, order_entry)
             if tx.state == TX_COMPLETED:
                 return Response("Checkout successful", status=200)
@@ -477,7 +485,7 @@ async def checkout(order_id: str):
                     stock_reply = await reserve_stock(tx.tx_id, item_id, to_reserve)
                     if stock_reply.status_code != 200:
                         if not tx.stock_released:
-                            await rollback_stock(tx.tx_id, tx.reserved_items)
+                            await rollback_stock(tx)
                             tx.stock_released = True
                             await _save_tx(tx)
 
@@ -496,7 +504,7 @@ async def checkout(order_id: str):
                 user_reply = await charge_user(tx.tx_id, tx.user_id, tx.total_cost)
                 if user_reply.status_code != 200:
                     if not tx.stock_released:
-                        await rollback_stock(tx.tx_id, tx.reserved_items)
+                        await rollback_stock(tx)
                         tx.stock_released = True
                         await _save_tx(tx)
 
@@ -514,24 +522,7 @@ async def checkout(order_id: str):
                 order_entry = await get_order_from_db(order_id)
                 order_entry.paid = True
 
-                try:
-                    await rset(order_id, msgpack.encode(order_entry))
-                except redis.exceptions.RedisError:
-                    if not tx.stock_released and tx.reserved_items:
-                        await rollback_stock(tx.tx_id, tx.reserved_items)
-                        tx.stock_released = True
-                        await _save_tx(tx)
-
-                    if tx.payment_done and not tx.payment_refunded:
-                        refund_reply = await refund_user(tx.tx_id, tx.user_id, tx.total_cost)
-                        if refund_reply.status_code == 200:
-                            tx.payment_refunded = True
-
-                    tx.state = TX_ABORTED
-                    tx.error = DB_ERROR_STR
-                    await _save_tx(tx)
-                    abort(400, DB_ERROR_STR)
-
+                await rset(order_id, msgpack.encode(order_entry))
                 tx.state = TX_COMPLETED
                 await _save_tx(tx)
 
