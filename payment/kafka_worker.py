@@ -107,8 +107,11 @@ class PaymentKafkaWorker:
         while self._loop is None:
             time.sleep(0.01)
 
-        fut = asyncio.run_coroutine_threadsafe(self._async_start(), self._loop)
-        fut.result(timeout=10)
+        fut = asyncio.run_coroutine_threadsafe(self._async_start_with_retry(), self._loop)
+        try:
+            fut.result(timeout=10)
+        except Exception:
+            pass
 
     def stop(self) -> None:
         self._stop_evt.set()
@@ -126,6 +129,17 @@ class PaymentKafkaWorker:
         self._loop = loop
         loop.run_forever()
 
+    async def _async_start_with_retry(self) -> None:
+        backoff = 1.0
+        while True:
+            try:
+                await self._async_start()
+                return
+            except Exception as e:
+                print(f"Kafka start error: {e}. Retrying in {backoff:.1f}s...")
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 30.0)
+
     async def _async_start(self) -> None:
         self._producer = AIOKafkaProducer(bootstrap_servers=self._bootstrap)
         await self._producer.start()
@@ -134,7 +148,7 @@ class PaymentKafkaWorker:
             self._commands_topic,
             bootstrap_servers=self._bootstrap,
             group_id=self._group_id,
-            enable_auto_commit=True,
+            enable_auto_commit=False,
             auto_offset_reset="earliest",
         )
         await self._consumer.start()
@@ -165,6 +179,7 @@ class PaymentKafkaWorker:
             try:
                 cmd = json.loads(msg.value.decode("utf-8"))
             except Exception:
+                await self._consumer.commit()
                 continue
 
             reply = self._handle_command(cmd)
@@ -172,6 +187,7 @@ class PaymentKafkaWorker:
             try:
                 payload = json.dumps(reply).encode("utf-8")
                 await self._producer.send_and_wait(self._replies_topic, payload)
+                await self._consumer.commit()
             except Exception:
                 # If we fail to publish the reply, client may timeout and retry.
                 # Our operations are idempotent on success.

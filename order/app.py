@@ -306,7 +306,7 @@ async def reserve_stock(tx_id: str, item_id: str, quantity: int):
         return await http_post(f"{GATEWAY_URL}/stock/subtract/{item_id}/{quantity}")
 
     cmd = {
-        "msg_id": str(uuid.uuid4()),
+        "msg_id": str(f"reserve:{tx_id}:{item_id}"),
         "tx_id": tx_id,
         "type": "reserve_stock",
         "payload": {"item_id": item_id, "quantity": quantity},
@@ -319,7 +319,7 @@ async def release_stock(tx_id: str, item_id: str, quantity: int):
         return await http_post(f"{GATEWAY_URL}/stock/add/{item_id}/{quantity}")
 
     cmd = {
-        "msg_id": str(uuid.uuid4()),
+        "msg_id": str(f"release:{tx_id}:{item_id}"),
         "tx_id": tx_id,
         "type": "release_stock",
         "payload": {"item_id": item_id, "quantity": quantity},
@@ -413,8 +413,8 @@ async def rollback_stock(tx: OrderTxValue) -> None:
             if reply.status_code == 200:
                 tx.reserved_items = [(i, q) for i, q in tx.reserved_items if i != item_id]
                 await _save_tx(tx)
-        except Exception:
-            pass
+        except Exception as e:
+            logging.warning(f"[SAGA] rollback_stock failed for item {item_id} (tx={tx.tx_id}): {e}")
         # sunt de acord
 
 def _reserved_as_dict(reserved_items: list[tuple[str, int]]) -> dict[str, int]:
@@ -451,6 +451,18 @@ async def checkout(order_id: str):
             if tx.state == TX_COMPLETED:
                 return Response("Checkout successful", status=200)
             if tx.state == TX_ABORTED:
+                # Retry any rollback that failed in a previous attempt before discarding this tx
+                if tx.reserved_items:
+                    await rollback_stock(tx)
+                    await _save_tx(tx)
+                    if tx.reserved_items:
+                        # Rollback still incomplete (service down) — force client to retry
+                        abort(503, "Compensating transaction in progress, please retry")
+                    tx.stock_released = True
+                    await _save_tx(tx)
+
+                tx_id = str(uuid.uuid4())                        # new tx_id
+                await rset(_order_tx_key(order_id), tx_id)       # overwrite order_tx:{order_id}
                 now = time.time()
                 tx = OrderTxValue(
                     tx_id=tx_id,
@@ -486,7 +498,8 @@ async def checkout(order_id: str):
                     if stock_reply.status_code != 200:
                         if not tx.stock_released:
                             await rollback_stock(tx)
-                            tx.stock_released = True
+                            if not tx.reserved_items:
+                                tx.stock_released = True
                             await _save_tx(tx)
 
                         tx.state = TX_ABORTED
@@ -505,7 +518,8 @@ async def checkout(order_id: str):
                 if user_reply.status_code != 200:
                     if not tx.stock_released:
                         await rollback_stock(tx)
-                        tx.stock_released = True
+                        if not tx.reserved_items:
+                            tx.stock_released = True
                         await _save_tx(tx)
 
                     tx.state = TX_ABORTED

@@ -45,16 +45,19 @@ def stock_dispatcher(command):
             return build_error(command, f"Missing field: {field}")
 
     msg_id = command["msg_id"]
-    log_key = f"saga:msg:{msg_id}"
+    msg_type = command["type"]
+    if msg_type == "release_stock":
+        item_id = command["payload"].get("item_id", "")
+        log_key = f"saga:release:{command['tx_id']}:{item_id}"
+    else:
+        log_key = f"saga:msg:{msg_id}"
 
     # -------------------------
     # IDEMPOTENCY CHECK
     # -------------------------
     existing = redis_client.get(log_key)
     if existing:
-        return json.loads(existing)
-
-    msg_type = command["type"]
+        return json.loads(existing)    
 
     try:
         if msg_type == "reserve_stock":
@@ -74,7 +77,7 @@ def stock_dispatcher(command):
     # -------------------------
     # STORE RESULT (durable log)
     # -------------------------
-    redis_client.set(log_key, json.dumps(reply),  ex=86400)
+    # redis_client.set(log_key, json.dumps(reply),  ex=86400)
 
     return reply
 
@@ -86,6 +89,7 @@ def stock_dispatcher(command):
 def handle_reserve_stock(command):
     item_id = command["payload"].get("item_id")
     quantity = int(command["payload"].get("quantity", 0))
+    log_key = f"saga:msg:{command['msg_id']}"
 
     if not item_id or quantity <= 0:
         return build_error(command, "Invalid payload")
@@ -105,9 +109,12 @@ def handle_reserve_stock(command):
                     if current_stock < quantity:
                         pipe.unwatch()
                         return build_error(command, "Insufficient stock")
+                    
+                    reply = build_success(command, {"item_id": item_id, "reserved": quantity})
 
                     pipe.multi()
                     pipe.hincrby(key, "stock", -quantity)
+                    pipe.set(log_key, json.dumps(reply),  ex=86400)
                     pipe.execute()
                     break
 
@@ -118,14 +125,12 @@ def handle_reserve_stock(command):
         # 2PL shrinking phase: release lock after operation completes
         release_lock(item_id, command["tx_id"])
 
-    return build_success(command, {
-        "item_id": item_id,
-        "reserved": quantity
-    })
+    return reply
 
 def handle_release_stock(command):
     item_id = command["payload"].get("item_id")
     quantity = int(command["payload"].get("quantity", 0))
+    log_key = f"saga:release:{command['tx_id']}:{item_id}"
 
     if not item_id or quantity <= 0:
         return build_error(command, "Invalid payload")
@@ -137,14 +142,16 @@ def handle_release_stock(command):
     try:
         if not redis_client.exists(key):
             return build_error(command, "Item not found")
+        
+        reply = build_success(command, {"item_id": item_id, "released": quantity})
 
-        redis_client.hincrby(key, "stock", quantity)
+        with redis_client.pipeline(transaction=True) as pipe:
+            pipe.hincrby(key, "stock", quantity)
+            pipe.set(log_key, json.dumps(reply), ex=86400)
+            pipe.execute()
 
     finally:
         # 2PL shrinking phase
         release_lock(item_id, command["tx_id"])
 
-    return build_success(command, {
-        "item_id": item_id,
-        "released": quantity
-    })
+    return reply

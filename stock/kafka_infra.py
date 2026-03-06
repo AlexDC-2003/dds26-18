@@ -94,7 +94,7 @@ class StockKafkaInfrastructure:
             self._commands_topic,
             bootstrap_servers=self._bootstrap,
             group_id=self._group_id,
-            enable_auto_commit=True,
+            enable_auto_commit=False,
             auto_offset_reset="earliest",
             value_deserializer=lambda b: json.loads(b.decode("utf-8")),
         )
@@ -127,6 +127,7 @@ class StockKafkaInfrastructure:
             reply = await loop.run_in_executor(None, self._dispatch_with_retry, command)
             try:
                 await self._producer.send_and_wait(self._replies_topic, reply)
+                await self._consumer.commit()
             except Exception as send_err:
                 print(f"Failed to send error reply: {send_err}")
 
