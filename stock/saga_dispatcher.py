@@ -45,7 +45,7 @@ def stock_dispatcher(command):
             return build_error(command, f"Missing field: {field}")
 
     msg_id = command["msg_id"]
-    log_key = f"saga:msg:{msg_id}"
+    log_key = f"stock:2pc:msg:{msg_id}"
 
     # -------------------------
     # IDEMPOTENCY CHECK
@@ -57,11 +57,18 @@ def stock_dispatcher(command):
     msg_type = command["type"]
 
     try:
-        if msg_type == "reserve_stock":
-            reply = handle_reserve_stock(command)
-
+        if msg_type == "prepare_stock":
+            reply = handle_prepare_stock(command)
+        elif msg_type == "commit_stock":
+            reply = handle_commit_stock(command)
+        elif msg_type == "abort_stock":
+            reply = handle_abort_stock(command)
+        elif msg_type == "reserve_stock":
+            # Backwards compatibility with previous Saga naming.
+            reply = handle_prepare_stock(command)
         elif msg_type == "release_stock":
-            reply = handle_release_stock(command)
+            # Backwards compatibility with previous Saga naming.
+            reply = handle_abort_stock(command)
 
         else:
             reply = build_error(command, f"Unknown command type: {msg_type}")
@@ -80,10 +87,34 @@ def stock_dispatcher(command):
 
 
 # ---------------------------------------------------------
-# SAGA HANDLERS
+# 2PC HANDLERS
 # ---------------------------------------------------------
 
-def handle_reserve_stock(command):
+def _tx_key(tx_id: str) -> str:
+    return f"stock:2pc:tx:{tx_id}"
+
+
+def _read_tx(tx_id: str):
+    raw = redis_client.get(_tx_key(tx_id))
+    if not raw:
+        return None
+    return json.loads(raw)
+
+
+def _write_tx(tx_id: str, tx_doc: dict) -> None:
+    redis_client.set(_tx_key(tx_id), json.dumps(tx_doc), ex=86400)
+
+
+def _new_tx(command: dict) -> dict:
+    return {
+        "tx_id": command["tx_id"],
+        "state": "PREPARED",
+        "items": {},
+        "updated_at": time.time(),
+    }
+
+
+def handle_prepare_stock(command):
     item_id = command["payload"].get("item_id")
     quantity = int(command["payload"].get("quantity", 0))
 
@@ -91,60 +122,93 @@ def handle_reserve_stock(command):
         return build_error(command, "Invalid payload")
 
     key = f"item:{item_id}"
-    acquire_lock(item_id, command["tx_id"])
-    try:
-        if not redis_client.exists(key):
-            return build_error(command, "Item not found")
+    tx_id = command["tx_id"]
+    tx = _read_tx(tx_id) or _new_tx(command)
+    if tx.get("state") == "ABORTED":
+        return build_error(command, "Transaction already aborted")
+    if tx.get("state") == "COMMITTED":
+        return build_success(command, {"item_id": item_id, "prepared": quantity, "state": "COMMITTED"})
 
-        with redis_client.pipeline() as pipe:
-            while True:
-                try:
-                    pipe.watch(key)
-                    current_stock = int(pipe.hget(key, "stock"))
+    prepared_map = tx.setdefault("items", {})
+    already_prepared = int(prepared_map.get(item_id, 0))
+    if already_prepared >= quantity:
+        return build_success(command, {"item_id": item_id, "prepared": already_prepared, "state": tx.get("state", "PREPARED")})
 
-                    if current_stock < quantity:
-                        pipe.unwatch()
-                        return build_error(command, "Insufficient stock")
+    acquire_lock(item_id, tx_id)
+    if not redis_client.exists(key):
+        release_lock(item_id, tx_id)
+        return build_error(command, "Item not found")
 
-                    pipe.multi()
-                    pipe.hincrby(key, "stock", -quantity)
-                    pipe.execute()
-                    break
+    current_stock = int(redis_client.hget(key, "stock"))
+    if current_stock < quantity:
+        release_lock(item_id, tx_id)
+        return build_error(command, "Insufficient stock")
 
-                except redis.WatchError:
-                    continue
+    prepared_map[item_id] = quantity
+    tx["state"] = "PREPARED"
+    tx["updated_at"] = time.time()
+    _write_tx(tx_id, tx)
 
-    finally:
-        # 2PL shrinking phase: release lock after operation completes
-        release_lock(item_id, command["tx_id"])
+    return build_success(command, {"item_id": item_id, "prepared": quantity, "state": "PREPARED"})
 
-    return build_success(command, {
-        "item_id": item_id,
-        "reserved": quantity
-    })
 
-def handle_release_stock(command):
-    item_id = command["payload"].get("item_id")
-    quantity = int(command["payload"].get("quantity", 0))
+def handle_commit_stock(command):
+    tx_id = command["tx_id"]
+    tx = _read_tx(tx_id)
+    if tx is None:
+        return build_success(command, {"state": "COMMITTED", "noop": True})
+    if tx.get("state") == "ABORTED":
+        return build_error(command, "Transaction already aborted")
+    if tx.get("state") == "COMMITTED":
+        return build_success(command, {"state": "COMMITTED", "noop": True})
 
-    if not item_id or quantity <= 0:
-        return build_error(command, "Invalid payload")
+    items = tx.get("items", {})
+    for item_id in sorted(items.keys()):
+        quantity = int(items[item_id])
+        key = f"item:{item_id}"
+        acquire_lock(item_id, tx_id)
+        try:
+            if not redis_client.exists(key):
+                return build_error(command, "Item not found")
+            with redis_client.pipeline() as pipe:
+                while True:
+                    try:
+                        pipe.watch(key)
+                        current_stock = int(pipe.hget(key, "stock"))
+                        if current_stock < quantity:
+                            pipe.unwatch()
+                            return build_error(command, "Insufficient stock at commit")
+                        pipe.multi()
+                        pipe.hincrby(key, "stock", -quantity)
+                        pipe.execute()
+                        break
+                    except redis.WatchError:
+                        continue
+        finally:
+            release_lock(item_id, tx_id)
 
-    key = f"item:{item_id}"
+    tx["state"] = "COMMITTED"
+    tx["updated_at"] = time.time()
+    _write_tx(tx_id, tx)
+    return build_success(command, {"state": "COMMITTED"})
 
-    # 2PL growing phase
-    acquire_lock(item_id, command["tx_id"])
-    try:
-        if not redis_client.exists(key):
-            return build_error(command, "Item not found")
 
-        redis_client.hincrby(key, "stock", quantity)
+def handle_abort_stock(command):
+    tx_id = command["tx_id"]
+    tx = _read_tx(tx_id)
+    if tx is None:
+        return build_success(command, {"state": "ABORTED", "noop": True})
+    if tx.get("state") == "ABORTED":
+        return build_success(command, {"state": "ABORTED", "noop": True})
+    if tx.get("state") == "COMMITTED":
+        return build_error(command, "Transaction already committed")
 
-    finally:
-        # 2PL shrinking phase
-        release_lock(item_id, command["tx_id"])
+    items = tx.get("items", {})
+    for item_id in sorted(items.keys()):
+        release_lock(item_id, tx_id)
 
-    return build_success(command, {
-        "item_id": item_id,
-        "released": quantity
-    })
+    tx["state"] = "ABORTED"
+    tx["updated_at"] = time.time()
+    _write_tx(tx_id, tx)
+
+    return build_success(command, {"state": "ABORTED"})

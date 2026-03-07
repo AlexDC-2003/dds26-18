@@ -9,24 +9,18 @@ import redis
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
 from msgspec import Struct, msgpack
 
-from lock_manager import LockManager, WaitDieAbort, LockTimeout, transaction_context
+from lock_manager import LockManager, Transaction, WaitDieAbort, LockTimeout
 
 
 class UserValue(Struct):
     credit: int
 
 
-class ChargeTxValue(Struct):
+class Payment2PCTxValue(Struct):
     user_id: str
     amount: int
-    credit_after: int
-    ts: float
-
-
-class RefundTxValue(Struct):
-    user_id: str
-    amount: int
-    credit_after: int
+    state: str
+    credit_after_prepare: int
     ts: float
 
 
@@ -183,7 +177,7 @@ class PaymentKafkaWorker:
         typ = cmd.get("type")
         payload = cmd.get("payload") or {}
 
-        # tx_ts allows the order service to propagate the saga's birth timestamp
+        # tx_ts allows the order service to propagate the transaction birth timestamp
         # so that 2PL age comparisons are meaningful across services.
         tx_ts = cmd.get("tx_ts")  # optional float; defaults to now inside Transaction
 
@@ -201,27 +195,56 @@ class PaymentKafkaWorker:
             return base
 
         try:
-            if typ == "charge_user":
+            if typ == "prepare_payment":
                 user_id = str(payload.get("user_id", ""))
                 amount = int(payload.get("amount", 0))
-                ok, err, new_credit = self._charge_user(tx_id, user_id, amount, tx_ts=tx_ts)
+                ok, err, new_credit = self._prepare_payment(tx_id, user_id, amount, tx_ts=tx_ts)
                 if ok:
                     base["status_code"] = 200
-                    base["payload"] = {"user_id": user_id, "amount": amount, "credit": new_credit}
+                    base["payload"] = {"user_id": user_id, "amount": amount, "credit": new_credit, "state": "PREPARED"}
                 else:
                     base["error"] = err
                 return base
 
-            if typ == "refund_user":
-                user_id = str(payload.get("user_id", ""))
-                amount = int(payload.get("amount", 0))
-                ok, err, new_credit = self._refund_user(tx_id, user_id, amount, tx_ts=tx_ts)
+            if typ == "commit_payment":
+                ok, err = self._commit_payment(tx_id, tx_ts=tx_ts)
                 if ok:
                     base["status_code"] = 200
-                    base["payload"] = {"user_id": user_id, "amount": amount, "credit": new_credit}
+                    base["payload"] = {"state": "COMMITTED"}
                 else:
                     base["error"] = err
                 return base
+
+            if typ == "abort_payment":
+                ok, err = self._abort_payment(tx_id, tx_ts=tx_ts)
+                if ok:
+                    base["status_code"] = 200
+                    base["payload"] = {"state": "ABORTED"}
+                else:
+                    base["error"] = err
+                return base
+
+            # if typ == "charge_user":
+            #     user_id = str(payload.get("user_id", ""))
+            #     amount = int(payload.get("amount", 0))
+            #     ok, err, new_credit = self._prepare_payment(tx_id, user_id, amount, tx_ts=tx_ts)
+            #     if ok:
+            #         base["status_code"] = 200
+            #         base["payload"] = {"user_id": user_id, "amount": amount, "credit": new_credit}
+            #     else:
+            #         base["error"] = err
+            #     return base
+
+            # if typ == "refund_user":
+            #     user_id = str(payload.get("user_id", ""))
+            #     amount = int(payload.get("amount", 0))
+            #     ok, err = self._abort_payment(tx_id, tx_ts=tx_ts)
+            #     if ok:
+            #         base["status_code"] = 200
+            #         base["payload"] = {"user_id": user_id, "amount": amount, "state": "ABORTED"}
+            #     else:
+            #         base["error"] = err
+            #     return base
 
             if typ == "health":
                 base["status_code"] = 200
@@ -239,7 +262,24 @@ class PaymentKafkaWorker:
     # Business logic — protected by 2PL
     # ------------------------------------------------------------------
 
-    def _charge_user(
+    def _acquire_user_lock(self, tx_id: str, user_id: str, *, tx_ts: Optional[float]) -> Tuple[bool, Optional[str]]:
+        try:
+            txn = Transaction(tx_id=tx_id, ts=tx_ts)
+            self._lock_manager.acquire(txn, f"user:{user_id}")
+            return True, None
+        except WaitDieAbort as e:
+            return False, f"wait-die abort: {e}"
+        except LockTimeout as e:
+            return False, f"lock timeout: {e}"
+        except redis.exceptions.RedisError as e:
+            return False, f"DB error: {e}"
+
+    def _release_user_lock(self, tx_id: str, user_id: str, *, tx_ts: Optional[float]) -> None:
+        txn = Transaction(tx_id=tx_id, ts=tx_ts)
+        txn._acquired.append(f"user:{user_id}")
+        self._lock_manager.release_all(txn)
+
+    def _prepare_payment(
         self,
         tx_id: str,
         user_id: str,
@@ -252,129 +292,126 @@ class PaymentKafkaWorker:
         if amount <= 0:
             return False, "amount must be > 0", None
 
-        tx_key = f"pay_tx:{tx_id}"
+        tx_key = f"pay_2pc_tx:{tx_id}"
 
-        # Fast idempotency check (no lock needed — tx record is immutable once written).
+        # Fast idempotency check.
         existing = self._db.get(tx_key)
         if existing:
-            tx = msgpack.decode(existing, type=ChargeTxValue)
-            return True, None, tx.credit_after
+            tx = msgpack.decode(existing, type=Payment2PCTxValue)
+            if tx.state == "ABORTED":
+                return False, "transaction already aborted", None
+            return True, None, tx.credit_after_prepare
 
-        # Resources we need to lock (sorted inside transaction_context too, but
-        # explicit ordering here makes the intent clear):
-        #   1. user record
-        #   2. idempotency key for this transaction
-        resources = [f"user:{user_id}", f"pay_tx:{tx_id}"]
+        lock_ok, lock_err = self._acquire_user_lock(tx_id, user_id, tx_ts=tx_ts)
+        if not lock_ok:
+            return False, lock_err, None
 
         try:
-            with transaction_context(
-                self._lock_manager,
-                resources,
-                tx_id=tx_id,
-                ts=tx_ts,
-            ) as txn:
-                # ---- Growing phase complete; now read and write ----
+            existing2 = self._db.get(tx_key)
+            if existing2:
+                tx = msgpack.decode(existing2, type=Payment2PCTxValue)
+                if tx.state == "ABORTED":
+                    return False, "transaction already aborted", None
+                return True, None, tx.credit_after_prepare
 
-                # Re-check idempotency under lock.
-                existing2 = self._db.get(tx_key)
-                if existing2:
-                    tx = msgpack.decode(existing2, type=ChargeTxValue)
-                    return True, None, tx.credit_after
+            raw_user = self._db.get(user_id)
+            if not raw_user:
+                self._release_user_lock(tx_id, user_id, tx_ts=tx_ts)
+                return False, f"User: {user_id} not found!", None
 
-                raw_user = self._db.get(user_id)
-                if not raw_user:
-                    return False, f"User: {user_id} not found!", None
+            user = msgpack.decode(raw_user, type=UserValue)
+            if user.credit < amount:
+                self._release_user_lock(tx_id, user_id, tx_ts=tx_ts)
+                return False, "User out of credit", None
 
-                user = msgpack.decode(raw_user, type=UserValue)
-                if user.credit < amount:
-                    return False, "User out of credit", None
-
-                user.credit -= amount
-                now = time.time()
-                tx_record = ChargeTxValue(
-                    user_id=user_id, amount=amount, credit_after=user.credit, ts=now
-                )
-
-                pipe = self._db.pipeline(transaction=True)
-                pipe.set(user_id, msgpack.encode(user))
-                pipe.set(tx_key, msgpack.encode(tx_record))
-                pipe.execute()
-
-                return True, None, user.credit
-
-        except WaitDieAbort as e:
-            return False, f"wait-die abort: {e}", None
-        except LockTimeout as e:
-            return False, f"lock timeout: {e}", None
+            tx_record = Payment2PCTxValue(
+                user_id=user_id,
+                amount=amount,
+                state="PREPARED",
+                credit_after_prepare=user.credit,
+                ts=time.time(),
+            )
+            self._db.set(tx_key, msgpack.encode(tx_record))
+            return True, None, user.credit
         except redis.exceptions.RedisError as e:
+            self._release_user_lock(tx_id, user_id, tx_ts=tx_ts)
             return False, f"DB error: {e}", None
 
-    def _refund_user(
+    def _commit_payment(
         self,
         tx_id: str,
-        user_id: str,
-        amount: int,
         *,
         tx_ts: Optional[float] = None,
-    ) -> Tuple[bool, Optional[str], Optional[int]]:
-        if not user_id:
-            return False, "missing user_id", None
-        if amount <= 0:
-            return False, "amount must be > 0", None
+    ) -> Tuple[bool, Optional[str]]:
+        tx_key = f"pay_2pc_tx:{tx_id}"
+        raw = self._db.get(tx_key)
+        if not raw:
+            return True, None
+        tx = msgpack.decode(raw, type=Payment2PCTxValue)
+        if tx.state == "COMMITTED":
+            return True, None
+        if tx.state == "ABORTED":
+            return False, "transaction already aborted"
 
-        charge_tx_key = f"pay_tx:{tx_id}"
-        refund_tx_key = f"refund_tx:{tx_id}"
-
-        # Fast idempotency check — already refunded.
-        existing_refund = self._db.get(refund_tx_key)
-        if existing_refund:
-            tx = msgpack.decode(existing_refund, type=RefundTxValue)
-            return True, None, tx.credit_after
-
-        # Safe no-op — never charged, so nothing to refund.
-        existing_charge = self._db.get(charge_tx_key)
-        if not existing_charge:
-            return True, None, None
-
-        resources = [f"user:{user_id}", f"refund_tx:{tx_id}"]
+        lock_ok, lock_err = self._acquire_user_lock(tx_id, tx.user_id, tx_ts=tx_ts)
+        if not lock_ok:
+            return False, lock_err
 
         try:
-            with transaction_context(
-                self._lock_manager,
-                resources,
-                tx_id=tx_id,
-                ts=tx_ts,
-            ) as txn:
-                # ---- Growing phase complete ----
+            raw2 = self._db.get(tx_key)
+            if not raw2:
+                self._release_user_lock(tx_id, tx.user_id, tx_ts=tx_ts)
+                return True, None
+            tx2 = msgpack.decode(raw2, type=Payment2PCTxValue)
+            if tx2.state == "COMMITTED":
+                self._release_user_lock(tx_id, tx2.user_id, tx_ts=tx_ts)
+                return True, None
+            if tx2.state == "ABORTED":
+                self._release_user_lock(tx_id, tx2.user_id, tx_ts=tx_ts)
+                return False, "transaction already aborted"
 
-                # Re-check idempotency under lock.
-                existing2 = self._db.get(refund_tx_key)
-                if existing2:
-                    tx = msgpack.decode(existing2, type=RefundTxValue)
-                    return True, None, tx.credit_after
+            raw_user = self._db.get(tx2.user_id)
+            if not raw_user:
+                self._release_user_lock(tx_id, tx2.user_id, tx_ts=tx_ts)
+                return False, f"User: {tx2.user_id} not found!"
+            user = msgpack.decode(raw_user, type=UserValue)
+            if user.credit < tx2.amount:
+                self._release_user_lock(tx_id, tx2.user_id, tx_ts=tx_ts)
+                return False, "User out of credit at commit"
 
-                raw_user = self._db.get(user_id)
-                if not raw_user:
-                    return False, f"User: {user_id} not found!", None
-
-                user = msgpack.decode(raw_user, type=UserValue)
-                user.credit += amount
-
-                now = time.time()
-                tx_record = RefundTxValue(
-                    user_id=user_id, amount=amount, credit_after=user.credit, ts=now
-                )
-
-                pipe = self._db.pipeline(transaction=True)
-                pipe.set(user_id, msgpack.encode(user))
-                pipe.set(refund_tx_key, msgpack.encode(tx_record))
-                pipe.execute()
-
-                return True, None, user.credit
-
-        except WaitDieAbort as e:
-            return False, f"wait-die abort: {e}", None
-        except LockTimeout as e:
-            return False, f"lock timeout: {e}", None
+            user.credit -= tx2.amount
+            tx2.state = "COMMITTED"
+            tx2.credit_after_prepare = user.credit
+            pipe = self._db.pipeline(transaction=True)
+            pipe.set(tx2.user_id, msgpack.encode(user))
+            pipe.set(tx_key, msgpack.encode(tx2))
+            pipe.execute()
+            self._release_user_lock(tx_id, tx2.user_id, tx_ts=tx_ts)
+            return True, None
         except redis.exceptions.RedisError as e:
-            return False, f"DB error: {e}", None
+            self._release_user_lock(tx_id, tx.user_id, tx_ts=tx_ts)
+            return False, f"DB error: {e}"
+
+    def _abort_payment(
+        self,
+        tx_id: str,
+        *,
+        tx_ts: Optional[float] = None,
+    ) -> Tuple[bool, Optional[str]]:
+        tx_key = f"pay_2pc_tx:{tx_id}"
+        raw = self._db.get(tx_key)
+        if not raw:
+            return True, None
+        tx = msgpack.decode(raw, type=Payment2PCTxValue)
+        if tx.state == "ABORTED":
+            return True, None
+        if tx.state == "COMMITTED":
+            return False, "transaction already committed"
+
+        try:
+            tx.state = "ABORTED"
+            self._db.set(tx_key, msgpack.encode(tx))
+            self._release_user_lock(tx_id, tx.user_id, tx_ts=tx_ts)
+            return True, None
+        except redis.exceptions.RedisError as e:
+            return False, f"DB error: {e}"

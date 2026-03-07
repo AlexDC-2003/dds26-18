@@ -74,15 +74,16 @@ class OrderValue(Struct):
     user_id: str
     total_cost: float
 
-# Saga transaction storage
+# 2PC transaction storage
 
 ORDER_TX_KEY_PREFIX = "order_tx:"   # maps order_id -> tx_id
 TX_KEY_PREFIX = "tx:"              # maps tx_id -> tx record
 
-# minimal saga states for the coordinator
+# coordinator states
 TX_STARTED = "STARTED"
-TX_STOCK_RESERVED = "STOCK_RESERVED"
-TX_PAYMENT_DONE = "PAYMENT_DONE"
+TX_PREPARING = "PREPARING"
+TX_PREPARED = "PREPARED"
+TX_COMMITTING = "COMMITTING"
 TX_COMPLETED = "COMPLETED"
 TX_ABORTED = "ABORTED"
 
@@ -96,18 +97,15 @@ class OrderTxValue(Struct):
     # snapshot of what we intended to buy (helps idempotency / debugging)
     items: list[tuple[str, int]]
 
-    # saga progress
+    # 2PC progress
     state: str
 
-    # what stock we've successfully subtracted so far (for idempotency + compensation)
-    reserved_items: list[tuple[str, int]]
-
-    # has payment been executed successfully?
-    payment_done: bool
-
-    # did we already refund after a failed finalize?
-    payment_refunded: bool
-    stock_released: bool
+    # what stock quantities are already prepared (deducted) for this tx
+    prepared_items: list[tuple[str, int]]
+    stock_prepared: bool
+    payment_prepared: bool
+    stock_committed: bool
+    payment_committed: bool
 
     # timestamps + error info
     created_at: float
@@ -222,10 +220,11 @@ async def _get_or_create_tx_record(tx_id: str, order_id: str, order_entry: Order
         total_cost=order_entry.total_cost,
         items=list(order_entry.items),
         state=TX_STARTED,
-        reserved_items=[],
-        payment_done=False,
-        payment_refunded=False,
-        stock_released=False,
+        prepared_items=[],
+        stock_prepared=False,
+        payment_prepared=False,
+        stock_committed=False,
+        payment_committed=False,
         created_at=now,
         updated_at=now,
         error=None,
@@ -301,54 +300,86 @@ def send_get_request(url: str):
     except requests.exceptions.RequestException as e:
         raise RuntimeError(REQ_ERROR_STR) from e
 
-async def reserve_stock(tx_id: str, item_id: str, quantity: int):
+async def prepare_stock(tx_id: str, item_id: str, quantity: int, *, tx_ts: float):
     if INTERNAL_TRANSPORT != "kafka":
-        return await http_post(f"{GATEWAY_URL}/stock/subtract/{item_id}/{quantity}")
+        return SimpleNamespace(status_code=400, json=lambda: {"error": "2PC requires Kafka transport"})
 
     cmd = {
         "msg_id": str(uuid.uuid4()),
         "tx_id": tx_id,
-        "type": "reserve_stock",
+        "tx_ts": tx_ts,
+        "type": "prepare_stock",
         "payload": {"item_id": item_id, "quantity": quantity},
     }
     reply = await kafka_bus.request(os.environ["KAFKA_STOCK_COMMANDS_TOPIC"], cmd, timeout_sec=KAFKA_TIMEOUT_SEC)
     return _as_response_like(reply, service="stock")
 
-async def release_stock(tx_id: str, item_id: str, quantity: int):
+async def commit_stock(tx_id: str, *, tx_ts: float):
     if INTERNAL_TRANSPORT != "kafka":
-        return await http_post(f"{GATEWAY_URL}/stock/add/{item_id}/{quantity}")
+        return SimpleNamespace(status_code=400, json=lambda: {"error": "2PC requires Kafka transport"})
 
     cmd = {
         "msg_id": str(uuid.uuid4()),
         "tx_id": tx_id,
-        "type": "release_stock",
-        "payload": {"item_id": item_id, "quantity": quantity},
+        "tx_ts": tx_ts,
+        "type": "commit_stock",
+        "payload": {},
     }
     reply = await kafka_bus.request(os.environ["KAFKA_STOCK_COMMANDS_TOPIC"], cmd, timeout_sec=KAFKA_TIMEOUT_SEC)
     return _as_response_like(reply, service="stock")
 
-async def charge_user(tx_id: str, user_id: str, amount: int | float):
+async def abort_stock(tx_id: str, *, tx_ts: float):
     if INTERNAL_TRANSPORT != "kafka":
-        return await http_post(f"{GATEWAY_URL}/payment/pay/{user_id}/{amount}")
+        return SimpleNamespace(status_code=400, json=lambda: {"error": "2PC requires Kafka transport"})
 
     cmd = {
         "msg_id": str(uuid.uuid4()),
         "tx_id": tx_id,
-        "type": "charge_user",
+        "tx_ts": tx_ts,
+        "type": "abort_stock",
+        "payload": {},
+    }
+    reply = await kafka_bus.request(os.environ["KAFKA_STOCK_COMMANDS_TOPIC"], cmd, timeout_sec=KAFKA_TIMEOUT_SEC)
+    return _as_response_like(reply, service="stock")
+
+async def prepare_payment(tx_id: str, user_id: str, amount: int | float, *, tx_ts: float):
+    if INTERNAL_TRANSPORT != "kafka":
+        return SimpleNamespace(status_code=400, json=lambda: {"error": "2PC requires Kafka transport"})
+
+    cmd = {
+        "msg_id": str(uuid.uuid4()),
+        "tx_id": tx_id,
+        "tx_ts": tx_ts,
+        "type": "prepare_payment",
         "payload": {"user_id": user_id, "amount": amount},
     }
     reply = await kafka_bus.request(os.environ["KAFKA_PAYMENT_COMMANDS_TOPIC"], cmd, timeout_sec=KAFKA_TIMEOUT_SEC)
     return _as_response_like(reply, service="payment")
 
-async def refund_user(tx_id: str, user_id: str, amount: int | float):
+async def commit_payment(tx_id: str, *, tx_ts: float):
     if INTERNAL_TRANSPORT != "kafka":
-        return await http_post(f"{GATEWAY_URL}/payment/add_funds/{user_id}/{amount}")
+        return SimpleNamespace(status_code=400, json=lambda: {"error": "2PC requires Kafka transport"})
 
     cmd = {
         "msg_id": str(uuid.uuid4()),
         "tx_id": tx_id,
-        "type": "refund_user",
-        "payload": {"user_id": user_id, "amount": amount},
+        "tx_ts": tx_ts,
+        "type": "commit_payment",
+        "payload": {},
+    }
+    reply = await kafka_bus.request(os.environ["KAFKA_PAYMENT_COMMANDS_TOPIC"], cmd, timeout_sec=KAFKA_TIMEOUT_SEC)
+    return _as_response_like(reply, service="payment")
+
+async def abort_payment(tx_id: str, *, tx_ts: float):
+    if INTERNAL_TRANSPORT != "kafka":
+        return SimpleNamespace(status_code=400, json=lambda: {"error": "2PC requires Kafka transport"})
+
+    cmd = {
+        "msg_id": str(uuid.uuid4()),
+        "tx_id": tx_id,
+        "tx_ts": tx_ts,
+        "type": "abort_payment",
+        "payload": {},
     }
     reply = await kafka_bus.request(os.environ["KAFKA_PAYMENT_COMMANDS_TOPIC"], cmd, timeout_sec=KAFKA_TIMEOUT_SEC)
     return _as_response_like(reply, service="payment")
@@ -405,32 +436,32 @@ async def add_item(order_id: str, item_id: str, quantity: int):
         status=200,
     )
 
-async def rollback_stock(tx: OrderTxValue) -> None:
-    still_reserved = list(tx.reserved_items)
-    for item_id, quantity in still_reserved:
-        try:
-            reply = await release_stock(tx.tx_id, item_id, quantity)
-            if reply.status_code == 200:
-                tx.reserved_items = [(i, q) for i, q in tx.reserved_items if i != item_id]
-                await _save_tx(tx)
-        except Exception:
-            pass
-        # sunt de acord
-
-def _reserved_as_dict(reserved_items: list[tuple[str, int]]) -> dict[str, int]:
+def _prepared_as_dict(prepared_items: list[tuple[str, int]]) -> dict[str, int]:
     d: dict[str, int] = defaultdict(int)
-    for item_id, qty in reserved_items:
+    for item_id, qty in prepared_items:
         d[item_id] += qty
     return d
 
 
-def _add_reserved(tx: OrderTxValue, item_id: str, qty: int) -> None:
-    # merge into tx.reserved_items
-    for i, (iid, q) in enumerate(tx.reserved_items):
+def _set_prepared_qty(tx: OrderTxValue, item_id: str, qty: int) -> None:
+    for i, (iid, _) in enumerate(tx.prepared_items):
         if iid == item_id:
-            tx.reserved_items[i] = (iid, q + qty)
+            tx.prepared_items[i] = (iid, qty)
             return
-    tx.reserved_items.append((item_id, qty))
+    tx.prepared_items.append((item_id, qty))
+
+
+async def _abort_participants(tx: OrderTxValue) -> None:
+    if tx.payment_prepared and not tx.payment_committed:
+        try:
+            await abort_payment(tx.tx_id, tx_ts=tx.created_at)
+        except Exception:
+            pass
+    if tx.stock_prepared and not tx.stock_committed:
+        try:
+            await abort_stock(tx.tx_id, tx_ts=tx.created_at)
+        except Exception:
+            pass
 
 
 @app.post('/checkout/<order_id>')
@@ -446,11 +477,13 @@ async def checkout(order_id: str):
         # Acquire locks first (2PL discipline)
         async with async_2pl(resources, tx_id=tx_id, ts=None):
             # Create/read tx inside lock
-            
+
             tx = await _get_or_create_tx_record(tx_id, order_id, order_entry)
             if tx.state == TX_COMPLETED:
                 return Response("Checkout successful", status=200)
             if tx.state == TX_ABORTED:
+                tx_id = str(uuid.uuid4())
+                await rset(_order_tx_key(order_id), tx_id)
                 now = time.time()
                 tx = OrderTxValue(
                     tx_id=tx_id,
@@ -459,10 +492,11 @@ async def checkout(order_id: str):
                     total_cost=order_entry.total_cost,
                     items=list(order_entry.items),
                     state=TX_STARTED,
-                    reserved_items=[],
-                    payment_done=False,
-                    payment_refunded=False,
-                    stock_released=False,
+                    prepared_items=[],
+                    stock_prepared=False,
+                    payment_prepared=False,
+                    stock_committed=False,
+                    payment_committed=False,
                     created_at=now,
                     updated_at=now,
                     error=None,
@@ -473,56 +507,66 @@ async def checkout(order_id: str):
             for item_id, quantity in tx.items:
                 items_quantities[item_id] += quantity
 
-            if tx.state == TX_STARTED:
-                reserved_now = _reserved_as_dict(tx.reserved_items)
+            if tx.state in (TX_STARTED, TX_PREPARING):
+                tx.state = TX_PREPARING
+                await _save_tx(tx)
 
+                prepared_now = _prepared_as_dict(tx.prepared_items)
                 for item_id, quantity in items_quantities.items():
-                    already = reserved_now.get(item_id, 0)
+                    already = prepared_now.get(item_id, 0)
                     if already >= quantity:
                         continue
-
-                    to_reserve = quantity - already
-                    stock_reply = await reserve_stock(tx.tx_id, item_id, to_reserve)
+                    stock_reply = await prepare_stock(tx.tx_id, item_id, quantity, tx_ts=tx.created_at)
                     if stock_reply.status_code != 200:
-                        if not tx.stock_released:
-                            await rollback_stock(tx)
-                            tx.stock_released = True
-                            await _save_tx(tx)
-
                         tx.state = TX_ABORTED
                         tx.error = f"Out of stock on item_id: {item_id}"
+                        await _abort_participants(tx)
                         await _save_tx(tx)
                         abort(400, tx.error)
-
-                    _add_reserved(tx, item_id, to_reserve)
+                    _set_prepared_qty(tx, item_id, quantity)
+                    tx.stock_prepared = True
                     await _save_tx(tx)
 
-                tx.state = TX_STOCK_RESERVED
-                await _save_tx(tx)
-
-            if tx.state == TX_STOCK_RESERVED and not tx.payment_done:
-                user_reply = await charge_user(tx.tx_id, tx.user_id, tx.total_cost)
-                if user_reply.status_code != 200:
-                    if not tx.stock_released:
-                        await rollback_stock(tx)
-                        tx.stock_released = True
+                if not tx.payment_prepared:
+                    user_reply = await prepare_payment(tx.tx_id, tx.user_id, tx.total_cost, tx_ts=tx.created_at)
+                    if user_reply.status_code != 200:
+                        tx.state = TX_ABORTED
+                        tx.error = "User out of credit"
+                        await _abort_participants(tx)
                         await _save_tx(tx)
-
-                    tx.state = TX_ABORTED
-                    tx.error = "User out of credit"
+                        abort(400, tx.error)
+                    tx.payment_prepared = True
                     await _save_tx(tx)
-                    abort(400, tx.error)
 
-                tx.payment_done = True
-                tx.state = TX_PAYMENT_DONE
+                tx.state = TX_PREPARED
                 await _save_tx(tx)
 
-            if tx.state == TX_PAYMENT_DONE:
-                # optionally re-read order under lock
+            if tx.state in (TX_PREPARED, TX_COMMITTING):
+                tx.state = TX_COMMITTING
+                await _save_tx(tx)
+
+                if not tx.stock_committed:
+                    stock_commit_reply = await commit_stock(tx.tx_id, tx_ts=tx.created_at)
+                    if stock_commit_reply.status_code != 200:
+                        tx.error = "Failed to commit stock"
+                        await _save_tx(tx)
+                        abort(503, tx.error)
+                    tx.stock_committed = True
+                    await _save_tx(tx)
+
+                if not tx.payment_committed:
+                    payment_commit_reply = await commit_payment(tx.tx_id, tx_ts=tx.created_at)
+                    if payment_commit_reply.status_code != 200:
+                        tx.error = "Failed to commit payment"
+                        await _save_tx(tx)
+                        abort(503, tx.error)
+                    tx.payment_committed = True
+                    await _save_tx(tx)
+
                 order_entry = await get_order_from_db(order_id)
                 order_entry.paid = True
-
                 await rset(order_id, msgpack.encode(order_entry))
+
                 tx.state = TX_COMPLETED
                 await _save_tx(tx)
 
