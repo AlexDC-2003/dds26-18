@@ -44,19 +44,6 @@ def stock_dispatcher(command):
         if field not in command:
             return build_error(command, f"Missing field: {field}")
 
-    msg_id = command["msg_id"]
-    if msg_id == "prepare_stock":
-        log_key = f"stock:2pc:msg:{msg_id}" # TOOD: consider different keys for commit and prepare pahses
-    else:
-        log_key = f"stock:2pc:msg:{msg_id}"
-
-    # -------------------------
-    # IDEMPOTENCY CHECK
-    # -------------------------
-    existing = redis_client.get(log_key)
-    if existing:
-        return json.loads(existing)
-
     msg_type = command["type"]
 
     try:
@@ -74,11 +61,6 @@ def stock_dispatcher(command):
         print(f"[2PL] Deadlock abort for tx {command.get('tx_id')}: {e}")
         time.sleep(random_backoff())
         raise
-
-    # -------------------------
-    # STORE RESULT (durable log)
-    # -------------------------
-    # redis_client.set(log_key, json.dumps(reply),  ex=86400)
 
     return reply
 
@@ -125,8 +107,6 @@ def handle_prepare_stock(command):
         return build_error(command, "Transaction already aborted")
     if tx.get("state") == "COMMITTED":
         return build_success(command, {"item_id": item_id, "prepared": quantity, "state": "COMMITTED"})
-    # if tx.get("state") == "PREPARED":
-    #     return build_success(command, {"item_id": item_id, "prepared": quantity, "state": "PREPARED"})
 
     prepared_map = tx.setdefault("items", {})
     already_prepared = int(prepared_map.get(item_id, 0))
@@ -143,7 +123,7 @@ def handle_prepare_stock(command):
         release_lock(item_id, tx_id)
         return build_error(command, "Insufficient stock")
 
-    prepared_map[item_id] = quantity # TODO: What if the program breaks here?
+    prepared_map[item_id] = quantity
     tx["state"] = "PREPARED"
     tx["updated_at"] = time.time()
     _write_tx(tx_id, tx)
