@@ -45,7 +45,10 @@ def stock_dispatcher(command):
             return build_error(command, f"Missing field: {field}")
 
     msg_id = command["msg_id"]
-    log_key = f"stock:2pc:msg:{msg_id}" # TOOD: consider different keys for commit and prepare pahses
+    if msg_id == "prepare_stock":
+        log_key = f"stock:2pc:msg:{msg_id}" # TOOD: consider different keys for commit and prepare pahses
+    else:
+        log_key = f"stock:2pc:msg:{msg_id}"
 
     # -------------------------
     # IDEMPOTENCY CHECK
@@ -111,7 +114,6 @@ def _new_tx(command: dict) -> dict:
 def handle_prepare_stock(command):
     item_id = command["payload"].get("item_id")
     quantity = int(command["payload"].get("quantity", 0))
-    log_key = f"saga:msg:{command['msg_id']}"
 
     if not item_id or quantity <= 0:
         return build_error(command, "Invalid payload")
@@ -123,6 +125,8 @@ def handle_prepare_stock(command):
         return build_error(command, "Transaction already aborted")
     if tx.get("state") == "COMMITTED":
         return build_success(command, {"item_id": item_id, "prepared": quantity, "state": "COMMITTED"})
+    # if tx.get("state") == "PREPARED":
+    #     return build_success(command, {"item_id": item_id, "prepared": quantity, "state": "PREPARED"})
 
     prepared_map = tx.setdefault("items", {})
     already_prepared = int(prepared_map.get(item_id, 0))
@@ -139,7 +143,7 @@ def handle_prepare_stock(command):
         release_lock(item_id, tx_id)
         return build_error(command, "Insufficient stock")
 
-    prepared_map[item_id] = quantity
+    prepared_map[item_id] = quantity # TODO: What if the program breaks here?
     tx["state"] = "PREPARED"
     tx["updated_at"] = time.time()
     _write_tx(tx_id, tx)
@@ -150,6 +154,8 @@ def handle_prepare_stock(command):
 def handle_commit_stock(command):
     tx_id = command["tx_id"]
     tx = _read_tx(tx_id)
+    # log_key = f"2pc:msg:{command['msg_id']}"
+
     if tx is None:
         return build_success(command, {"state": "COMMITTED", "noop": True})
     if tx.get("state") == "ABORTED":
@@ -161,7 +167,6 @@ def handle_commit_stock(command):
     for item_id in sorted(items.keys()):
         quantity = int(items[item_id])
         key = f"item:{item_id}"
-        # acquire_lock(item_id, tx_id)
         try:
             if not redis_client.exists(key):
                 return build_error(command, "Item not found")
@@ -172,9 +177,11 @@ def handle_commit_stock(command):
                         current_stock = int(pipe.hget(key, "stock"))
                         if current_stock < quantity:
                             pipe.unwatch()
-                            return build_error(command, "Insufficient stock at commit")
+                            reply = build_error(command, "Insufficient stock at commit")
+                        reply = build_success(command, {"state": "COMMITTED"})
                         pipe.multi()
                         pipe.hincrby(key, "stock", -quantity)
+                        # pipe.set(log_key, json.dumps(reply),  ex=86400)
                         pipe.execute()
                         break
                     except redis.WatchError:
@@ -185,7 +192,7 @@ def handle_commit_stock(command):
     tx["state"] = "COMMITTED"
     tx["updated_at"] = time.time()
     _write_tx(tx_id, tx)
-    return build_success(command, {"state": "COMMITTED"})
+    return reply
 
 
 def handle_abort_stock(command):

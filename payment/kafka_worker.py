@@ -280,7 +280,7 @@ class PaymentKafkaWorker:
 
     def _acquire_user_lock(self, tx_id: str, user_id: str, *, tx_ts: Optional[float]) -> Tuple[bool, Optional[str]]:
         try:
-            txn = Transaction(tx_id=tx_id, ts=tx_ts)
+            txn = Transaction(tx_id=tx_id, ts=tx_ts) # TODO: mebe not in a new transaction
             self._lock_manager.acquire(txn, f"user:{user_id}")
             return True, None
         except WaitDieAbort as e:

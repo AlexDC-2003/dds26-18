@@ -335,7 +335,8 @@ async def abort_stock(tx_id: str, *, tx_ts: float):
         return SimpleNamespace(status_code=400, json=lambda: {"error": "2PC requires Kafka transport"})
 
     cmd = {
-        "msg_id": str(f"release:{tx_id}:{item_id}"),
+        # "msg_id": str(f"release:{tx_id}:{item_id}"),
+        "msg_id": str(uuid.uuid4()),
         "tx_id": tx_id,
         "tx_ts": tx_ts,
         "type": "abort_stock",
@@ -591,8 +592,8 @@ async def checkout(order_id: str):
                         await _save_tx(tx)
 
 
-                    if not (tx.payment_committed and tx.stock_committed):
-                        await asyncio.sleep(COMMIT_RETRY_SLEEP_SEC)
+                    # if not (tx.payment_committed and tx.stock_committed):
+                    #     await asyncio.sleep(COMMIT_RETRY_SLEEP_SEC)
 
                 tx.error = None
                 await _save_tx(tx)
