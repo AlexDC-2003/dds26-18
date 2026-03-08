@@ -335,7 +335,6 @@ async def abort_stock(tx_id: str, *, tx_ts: float):
         return SimpleNamespace(status_code=400, json=lambda: {"error": "2PC requires Kafka transport"})
 
     cmd = {
-        # "msg_id": str(f"release:{tx_id}:{item_id}"),
         "msg_id": str(uuid.uuid4()),
         "tx_id": tx_id,
         "tx_ts": tx_ts,
@@ -438,18 +437,6 @@ async def add_item(order_id: str, item_id: str, quantity: int):
         f"Item: {item_id} added to: {order_id} price updated to: {order_entry.total_cost}",
         status=200,
     )
-
-# async def rollback_stock(tx: OrderTxValue) -> None:
-#     still_reserved = list(tx.reserved_items)
-#     for item_id, quantity in still_reserved:
-#         try:
-#             reply = await release_stock(tx.tx_id, item_id, quantity)
-#             if reply.status_code == 200:
-#                 tx.reserved_items = [(i, q) for i, q in tx.reserved_items if i != item_id]
-#                 await _save_tx(tx)
-#         except Exception as e:
-#             logging.warning(f"[SAGA] rollback_stock failed for item {item_id} (tx={tx.tx_id}): {e}")
-#         # sunt de acord
 
 def _prepared_as_dict(prepared_items: list[tuple[str, int]]) -> dict[str, int]:
     d: dict[str, int] = defaultdict(int)
@@ -560,21 +547,7 @@ async def checkout(order_id: str):
                 tx.state = TX_COMMITTING
                 await _save_tx(tx)
 
-                commit_deadline = time.monotonic() + COMMIT_RETRY_TIMEOUT_SEC
                 while not (tx.payment_committed and tx.stock_committed):
-                    # if time.monotonic() >= commit_deadline:
-                    #     pending: list[str] = []
-                    #     if not tx.payment_committed:
-                    #         pending.append("payment")
-                    #     if not tx.stock_committed:
-                    #         pending.append("stock")
-                    #     tx.error = (
-                    #         f"Commit retry timeout after {COMMIT_RETRY_TIMEOUT_SEC}s; "
-                    #         f"pending: {', '.join(pending)}"
-                    #     )
-                    #     await _save_tx(tx)
-                    #     abort(503, tx.error)
-
                     if not tx.payment_committed:
                         payment_commit_reply = await commit_payment(tx.tx_id, tx_ts=tx.created_at)
                         if payment_commit_reply.status_code == 200:
@@ -590,10 +563,6 @@ async def checkout(order_id: str):
                         else:
                             tx.error = "Failed to commit stock, retrying"
                         await _save_tx(tx)
-
-
-                    # if not (tx.payment_committed and tx.stock_committed):
-                    #     await asyncio.sleep(COMMIT_RETRY_SLEEP_SEC)
 
                 tx.error = None
                 await _save_tx(tx)

@@ -240,28 +240,6 @@ class PaymentKafkaWorker:
                     base["error"] = err
                 return base
 
-            # if typ == "charge_user":
-            #     user_id = str(payload.get("user_id", ""))
-            #     amount = int(payload.get("amount", 0))
-            #     ok, err, new_credit = self._prepare_payment(tx_id, user_id, amount, tx_ts=tx_ts)
-            #     if ok:
-            #         base["status_code"] = 200
-            #         base["payload"] = {"user_id": user_id, "amount": amount, "credit": new_credit}
-            #     else:
-            #         base["error"] = err
-            #     return base
-
-            # if typ == "refund_user":
-            #     user_id = str(payload.get("user_id", ""))
-            #     amount = int(payload.get("amount", 0))
-            #     ok, err = self._abort_payment(tx_id, tx_ts=tx_ts)
-            #     if ok:
-            #         base["status_code"] = 200
-            #         base["payload"] = {"user_id": user_id, "amount": amount, "state": "ABORTED"}
-            #     else:
-            #         base["error"] = err
-            #     return base
-
             if typ == "health":
                 base["status_code"] = 200
                 base["payload"] = {"ok": True}
@@ -369,10 +347,6 @@ class PaymentKafkaWorker:
         if tx.state == "ABORTED":
             return False, "transaction already aborted"
 
-        # lock_ok, lock_err = self._acquire_user_lock(tx_id, tx.user_id, tx_ts=tx_ts)
-        # if not lock_ok:
-        #     return False, lock_err
-
         try:
             raw2 = self._db.get(tx_key)
             if not raw2:
@@ -387,13 +361,7 @@ class PaymentKafkaWorker:
                 return False, "transaction already aborted"
 
             raw_user = self._db.get(tx2.user_id)
-            # if not raw_user:
-            #     self._release_user_lock(tx_id, tx2.user_id, tx_ts=tx_ts)
-            #     return False, f"User: {tx2.user_id} not found!"
             user = msgpack.decode(raw_user, type=UserValue)
-            # if user.credit < tx2.amount:
-            #     self._release_user_lock(tx_id, tx2.user_id, tx_ts=tx_ts)
-            #     return False, "User out of credit at commit"
 
             user.credit -= tx2.amount
             tx2.state = "COMMITTED"
