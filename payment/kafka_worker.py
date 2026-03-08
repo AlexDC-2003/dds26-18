@@ -74,6 +74,7 @@ class PaymentKafkaWorker:
     def __init__(self, *, db: redis.Redis) -> None:
         self._db = db
         self._lock_manager = LockManager(db=db)
+        self._tx_contexts: Dict[str, Transaction] = {}
 
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._thread: Optional[threading.Thread] = None
@@ -256,9 +257,16 @@ class PaymentKafkaWorker:
     # Business logic — protected by 2PL
     # ------------------------------------------------------------------
 
+    def _get_or_create_tx_context(self, tx_id: str, *, tx_ts: Optional[float]) -> Transaction:
+        txn = self._tx_contexts.get(tx_id)
+        if txn is None:
+            txn = Transaction(tx_id=tx_id, ts=tx_ts)
+            self._tx_contexts[tx_id] = txn
+        return txn
+
     def _acquire_user_lock(self, tx_id: str, user_id: str, *, tx_ts: Optional[float]) -> Tuple[bool, Optional[str]]:
         try:
-            txn = Transaction(tx_id=tx_id, ts=tx_ts) # TODO: mebe not in a new transaction
+            txn = self._get_or_create_tx_context(tx_id, tx_ts=tx_ts)
             self._lock_manager.acquire(txn, f"user:{user_id}")
             return True, None
         except WaitDieAbort as e:
@@ -268,10 +276,10 @@ class PaymentKafkaWorker:
         except redis.exceptions.RedisError as e:
             return False, f"DB error: {e}"
 
-    def _release_user_lock(self, tx_id: str, user_id: str, *, tx_ts: Optional[float]) -> None:
-        txn = Transaction(tx_id=tx_id, ts=tx_ts) # TODO: maybe here transaction is not neccessary, maybe it is acutally harmful
-        txn._acquired.append(f"user:{user_id}")
-        self._lock_manager.release_all(txn)
+    def _release_tx_locks(self, tx_id: str) -> None:
+        txn = self._tx_contexts.pop(tx_id, None)
+        if txn is not None:
+            self._lock_manager.release_all(txn)
 
     def _prepare_payment(
         self,
@@ -310,12 +318,12 @@ class PaymentKafkaWorker:
 
             raw_user = self._db.get(user_id)
             if not raw_user:
-                self._release_user_lock(tx_id, user_id, tx_ts=tx_ts)
+                self._release_tx_locks(tx_id)
                 return False, f"User: {user_id} not found!", None
 
             user = msgpack.decode(raw_user, type=UserValue)
             if user.credit < amount:
-                self._release_user_lock(tx_id, user_id, tx_ts=tx_ts)
+                self._release_tx_locks(tx_id)
                 return False, "User out of credit", None
 
             tx_record = Payment2PCTxValue(
@@ -328,7 +336,7 @@ class PaymentKafkaWorker:
             self._db.set(tx_key, msgpack.encode(tx_record))
             return True, None, user.credit
         except redis.exceptions.RedisError as e:
-            self._release_user_lock(tx_id, user_id, tx_ts=tx_ts)
+            self._release_tx_locks(tx_id)
             return False, f"DB error: {e}", None
 
     def _commit_payment(
@@ -350,14 +358,11 @@ class PaymentKafkaWorker:
         try:
             raw2 = self._db.get(tx_key)
             if not raw2:
-                self._release_user_lock(tx_id, tx.user_id, tx_ts=tx_ts)
                 return True, None
             tx2 = msgpack.decode(raw2, type=Payment2PCTxValue)
             if tx2.state == "COMMITTED":
-                self._release_user_lock(tx_id, tx2.user_id, tx_ts=tx_ts)
                 return True, None
             if tx2.state == "ABORTED":
-                self._release_user_lock(tx_id, tx2.user_id, tx_ts=tx_ts)
                 return False, "transaction already aborted"
 
             raw_user = self._db.get(tx2.user_id)
@@ -370,13 +375,12 @@ class PaymentKafkaWorker:
             pipe.set(tx2.user_id, msgpack.encode(user))
             pipe.set(tx_key, msgpack.encode(tx2))
             pipe.execute()
+            return True, None
 
         except redis.exceptions.RedisError as e:
-            self._release_user_lock(tx_id, tx.user_id, tx_ts=tx_ts)
             return False, f"DB error: {e}"
         finally:
-            self._release_user_lock(tx_id, tx2.user_id, tx_ts=tx_ts)
-            return True, None
+            self._release_tx_locks(tx_id)
 
     def _abort_payment(
         self,
@@ -397,7 +401,7 @@ class PaymentKafkaWorker:
         try:
             tx.state = "ABORTED"
             self._db.set(tx_key, msgpack.encode(tx))
-            self._release_user_lock(tx_id, tx.user_id, tx_ts=tx_ts)
+            self._release_tx_locks(tx_id)
             return True, None
         except redis.exceptions.RedisError as e:
             return False, f"DB error: {e}"
