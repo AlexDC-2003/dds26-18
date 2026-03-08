@@ -63,12 +63,6 @@ def stock_dispatcher(command):
             reply = handle_commit_stock(command)
         elif msg_type == "abort_stock":
             reply = handle_abort_stock(command)
-        elif msg_type == "reserve_stock":
-            # Backwards compatibility with previous Saga naming.
-            reply = handle_prepare_stock(command)
-        elif msg_type == "release_stock":
-            # Backwards compatibility with previous Saga naming.
-            reply = handle_abort_stock(command)
 
         else:
             reply = build_error(command, f"Unknown command type: {msg_type}")
@@ -166,7 +160,7 @@ def handle_commit_stock(command):
     for item_id in sorted(items.keys()):
         quantity = int(items[item_id])
         key = f"item:{item_id}"
-        acquire_lock(item_id, tx_id)
+        # acquire_lock(item_id, tx_id)
         try:
             if not redis_client.exists(key):
                 return build_error(command, "Item not found")

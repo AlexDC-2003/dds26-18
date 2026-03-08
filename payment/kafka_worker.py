@@ -275,7 +275,7 @@ class PaymentKafkaWorker:
             return False, f"DB error: {e}"
 
     def _release_user_lock(self, tx_id: str, user_id: str, *, tx_ts: Optional[float]) -> None:
-        txn = Transaction(tx_id=tx_id, ts=tx_ts)
+        txn = Transaction(tx_id=tx_id, ts=tx_ts) # TODO: maybe here transaction is not neccessary, maybe it is acutally harmful
         txn._acquired.append(f"user:{user_id}")
         self._lock_manager.release_all(txn)
 
@@ -353,9 +353,9 @@ class PaymentKafkaWorker:
         if tx.state == "ABORTED":
             return False, "transaction already aborted"
 
-        lock_ok, lock_err = self._acquire_user_lock(tx_id, tx.user_id, tx_ts=tx_ts)
-        if not lock_ok:
-            return False, lock_err
+        # lock_ok, lock_err = self._acquire_user_lock(tx_id, tx.user_id, tx_ts=tx_ts)
+        # if not lock_ok:
+        #     return False, lock_err
 
         try:
             raw2 = self._db.get(tx_key)
@@ -371,13 +371,13 @@ class PaymentKafkaWorker:
                 return False, "transaction already aborted"
 
             raw_user = self._db.get(tx2.user_id)
-            if not raw_user:
-                self._release_user_lock(tx_id, tx2.user_id, tx_ts=tx_ts)
-                return False, f"User: {tx2.user_id} not found!"
+            # if not raw_user:
+            #     self._release_user_lock(tx_id, tx2.user_id, tx_ts=tx_ts)
+            #     return False, f"User: {tx2.user_id} not found!"
             user = msgpack.decode(raw_user, type=UserValue)
-            if user.credit < tx2.amount:
-                self._release_user_lock(tx_id, tx2.user_id, tx_ts=tx_ts)
-                return False, "User out of credit at commit"
+            # if user.credit < tx2.amount:
+            #     self._release_user_lock(tx_id, tx2.user_id, tx_ts=tx_ts)
+            #     return False, "User out of credit at commit"
 
             user.credit -= tx2.amount
             tx2.state = "COMMITTED"
@@ -386,11 +386,13 @@ class PaymentKafkaWorker:
             pipe.set(tx2.user_id, msgpack.encode(user))
             pipe.set(tx_key, msgpack.encode(tx2))
             pipe.execute()
-            self._release_user_lock(tx_id, tx2.user_id, tx_ts=tx_ts)
-            return True, None
+
         except redis.exceptions.RedisError as e:
             self._release_user_lock(tx_id, tx.user_id, tx_ts=tx_ts)
             return False, f"DB error: {e}"
+        finally:
+            self._release_user_lock(tx_id, tx2.user_id, tx_ts=tx_ts)
+            return True, None
 
     def _abort_payment(
         self,

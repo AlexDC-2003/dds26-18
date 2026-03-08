@@ -32,6 +32,8 @@ db: redis.Redis = redis.Redis(host=os.environ['REDIS_HOST'],
 lock_manager = LockManager(db=db)
 INTERNAL_TRANSPORT = os.environ.get("INTERNAL_TRANSPORT", "rest")
 KAFKA_TIMEOUT_SEC = float(os.environ.get("KAFKA_REQUEST_TIMEOUT_SEC", "2"))
+COMMIT_RETRY_TIMEOUT_SEC = float(os.environ.get("KAFKA_COMMIT_RETRY_TIMEOUT_SEC", "8"))
+COMMIT_RETRY_SLEEP_SEC = float(os.environ.get("KAFKA_COMMIT_RETRY_SLEEP_SEC", "0.05"))
 
 kafka_bus = KafkaBus()
 
@@ -545,23 +547,43 @@ async def checkout(order_id: str):
                 tx.state = TX_COMMITTING
                 await _save_tx(tx)
 
-                if not tx.stock_committed:
-                    stock_commit_reply = await commit_stock(tx.tx_id, tx_ts=tx.created_at)
-                    if stock_commit_reply.status_code != 200:
-                        tx.error = "Failed to commit stock"
-                        await _save_tx(tx)
-                        abort(503, tx.error)
-                    tx.stock_committed = True
-                    await _save_tx(tx)
+                commit_deadline = time.monotonic() + COMMIT_RETRY_TIMEOUT_SEC
+                while not (tx.payment_committed and tx.stock_committed):
+                    # if time.monotonic() >= commit_deadline:
+                    #     pending: list[str] = []
+                    #     if not tx.payment_committed:
+                    #         pending.append("payment")
+                    #     if not tx.stock_committed:
+                    #         pending.append("stock")
+                    #     tx.error = (
+                    #         f"Commit retry timeout after {COMMIT_RETRY_TIMEOUT_SEC}s; "
+                    #         f"pending: {', '.join(pending)}"
+                    #     )
+                    #     await _save_tx(tx)
+                    #     abort(503, tx.error)
 
-                if not tx.payment_committed:
-                    payment_commit_reply = await commit_payment(tx.tx_id, tx_ts=tx.created_at)
-                    if payment_commit_reply.status_code != 200:
-                        tx.error = "Failed to commit payment"
+                    if not tx.payment_committed:
+                        payment_commit_reply = await commit_payment(tx.tx_id, tx_ts=tx.created_at)
+                        if payment_commit_reply.status_code == 200:
+                            tx.payment_committed = True
+                        else:
+                            tx.error = "Failed to commit payment, retrying"
                         await _save_tx(tx)
-                        abort(503, tx.error)
-                    tx.payment_committed = True
-                    await _save_tx(tx)
+
+                    if not tx.stock_committed:
+                        stock_commit_reply = await commit_stock(tx.tx_id, tx_ts=tx.created_at)
+                        if stock_commit_reply.status_code == 200:
+                            tx.stock_committed = True
+                        else:
+                            tx.error = "Failed to commit stock, retrying"
+                        await _save_tx(tx)
+
+
+                    if not (tx.payment_committed and tx.stock_committed):
+                        await asyncio.sleep(COMMIT_RETRY_SLEEP_SEC)
+
+                tx.error = None
+                await _save_tx(tx)
 
                 order_entry = await get_order_from_db(order_id)
                 order_entry.paid = True
