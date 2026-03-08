@@ -45,7 +45,7 @@ def stock_dispatcher(command):
             return build_error(command, f"Missing field: {field}")
 
     msg_id = command["msg_id"]
-    log_key = f"stock:2pc:msg:{msg_id}"
+    log_key = f"stock:2pc:msg:{msg_id}" # TOOD: consider different keys for commit and prepare pahses
 
     # -------------------------
     # IDEMPOTENCY CHECK
@@ -75,7 +75,7 @@ def stock_dispatcher(command):
     # -------------------------
     # STORE RESULT (durable log)
     # -------------------------
-    redis_client.set(log_key, json.dumps(reply),  ex=86400)
+    # redis_client.set(log_key, json.dumps(reply),  ex=86400)
 
     return reply
 
@@ -111,6 +111,7 @@ def _new_tx(command: dict) -> dict:
 def handle_prepare_stock(command):
     item_id = command["payload"].get("item_id")
     quantity = int(command["payload"].get("quantity", 0))
+    log_key = f"saga:msg:{command['msg_id']}"
 
     if not item_id or quantity <= 0:
         return build_error(command, "Invalid payload")

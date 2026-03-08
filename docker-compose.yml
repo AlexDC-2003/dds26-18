@@ -15,6 +15,7 @@ services:
   order-service:
     build: ./order
     image: order:latest
+    restart: always
     environment:
       - GATEWAY_URL=http://gateway:80
       - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
@@ -37,11 +38,15 @@ services:
 
   order-db:
     image: redis:7.2-bookworm
-    command: redis-server --requirepass redis --maxmemory 512mb
+    restart: always
+    command: redis-server --requirepass redis --maxmemory 512mb --appendonly yes
+    volumes:
+      - order-db-data:/data
 
   stock-service:
     build: ./stock
     image: stock:latest
+    restart: always
     environment:
       - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
       - KAFKA_STOCK_COMMANDS_TOPIC=stock.commands
@@ -60,11 +65,15 @@ services:
 
   stock-db:
     image: redis:7.2-bookworm
-    command: redis-server --requirepass redis --maxmemory 512mb
+    restart: always
+    command: redis-server --requirepass redis --maxmemory 512mb --appendonly yes
+    volumes:
+      - stock-db-data:/data
 
   payment-service:
     build: ./payment
     image: user:latest
+    restart: always
     environment:
       - INTERNAL_TRANSPORT=kafka
       - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
@@ -85,7 +94,10 @@ services:
 
   payment-db:
     image: redis:7.2-bookworm
-    command: redis-server --requirepass redis --maxmemory 512mb
+    restart: always
+    command: redis-server --requirepass redis --maxmemory 512mb --appendonly yes
+    volumes:
+      - payment-db-data:/data
 
   zookeeper:
     image: confluentinc/cp-zookeeper:7.6.1
@@ -137,5 +149,29 @@ services:
         condition: service_healthy
     volumes:
       - ./create_topics.sh:/create_topics.sh:ro
-    entrypoint: [ "/bin/bash", "/create_topics.sh" ]
+    entrypoint: [ "/bin/bash", "-c", "tr -d '\\r' < /create_topics.sh | bash" ]
     restart: "no"
+    
+  watchdog:
+    image: docker:cli
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    entrypoint: |
+      sh -c '
+      while true; do
+        for service in dds26-18-stock-service-1 dds26-18-order-service-1 dds26-18-payment-service-1 dds26-18-stock-db-1 dds26-18-order-db-1 dds26-18-payment-db-1; do
+          STATUS=$$(docker inspect $$service --format="{{.State.Status}}" 2>/dev/null)
+          if [ "$$STATUS" = "exited" ] || [ "$$STATUS" = "dead" ]; then
+            echo "$$service is down, restarting..."
+            docker start $$service
+          fi
+        done
+        sleep 2
+      done
+      '
+    restart: always
+
+volumes:
+  order-db-data:
+  stock-db-data:
+  payment-db-data:

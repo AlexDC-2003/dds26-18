@@ -307,7 +307,7 @@ async def prepare_stock(tx_id: str, item_id: str, quantity: int, *, tx_ts: float
         return SimpleNamespace(status_code=400, json=lambda: {"error": "2PC requires Kafka transport"})
 
     cmd = {
-        "msg_id": str(uuid.uuid4()),
+        "msg_id": str(f"reserve:{tx_id}:{item_id}"),
         "tx_id": tx_id,
         "tx_ts": tx_ts,
         "type": "prepare_stock",
@@ -335,7 +335,7 @@ async def abort_stock(tx_id: str, *, tx_ts: float):
         return SimpleNamespace(status_code=400, json=lambda: {"error": "2PC requires Kafka transport"})
 
     cmd = {
-        "msg_id": str(uuid.uuid4()),
+        "msg_id": str(f"release:{tx_id}:{item_id}"),
         "tx_id": tx_id,
         "tx_ts": tx_ts,
         "type": "abort_stock",
@@ -437,6 +437,18 @@ async def add_item(order_id: str, item_id: str, quantity: int):
         f"Item: {item_id} added to: {order_id} price updated to: {order_entry.total_cost}",
         status=200,
     )
+
+# async def rollback_stock(tx: OrderTxValue) -> None:
+#     still_reserved = list(tx.reserved_items)
+#     for item_id, quantity in still_reserved:
+#         try:
+#             reply = await release_stock(tx.tx_id, item_id, quantity)
+#             if reply.status_code == 200:
+#                 tx.reserved_items = [(i, q) for i, q in tx.reserved_items if i != item_id]
+#                 await _save_tx(tx)
+#         except Exception as e:
+#             logging.warning(f"[SAGA] rollback_stock failed for item {item_id} (tx={tx.tx_id}): {e}")
+#         # sunt de acord
 
 def _prepared_as_dict(prepared_items: list[tuple[str, int]]) -> dict[str, int]:
     d: dict[str, int] = defaultdict(int)
