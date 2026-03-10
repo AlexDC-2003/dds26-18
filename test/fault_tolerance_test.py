@@ -301,8 +301,10 @@ async def main():
         # This catches orders where checkout returned 200 but the order.paid write
         # was lost in the Redis AOF fsync window (everysec), leaving the charge
         # orphaned in payment-db without a corresponding paid order.
+        fetch_sem = asyncio.Semaphore(50)
         async def fetch_paid(oid):
-            sc, j = await aget(session, f"/orders/find/{oid}")
+            async with fetch_sem:
+                sc, j = await aget(session, f"/orders/find/{oid}")
             return oid, j.get("paid", False)
 
         paid_states = dict(await asyncio.gather(*[fetch_paid(oid) for oid in order_ids]))
