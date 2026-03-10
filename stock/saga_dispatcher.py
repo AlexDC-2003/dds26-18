@@ -130,11 +130,9 @@ def handle_prepare_stock(command):
 
     return build_success(command, {"item_id": item_id, "prepared": quantity, "state": "PREPARED"})
 
-
 def handle_commit_stock(command):
     tx_id = command["tx_id"]
     tx = _read_tx(tx_id)
-    # log_key = f"2pc:msg:{command['msg_id']}"
 
     if tx is None:
         return build_success(command, {"state": "COMMITTED", "noop": True})
@@ -149,7 +147,9 @@ def handle_commit_stock(command):
         key = f"item:{item_id}"
         try:
             if not redis_client.exists(key):
+                release_lock(item_id, tx_id)
                 return build_error(command, "Item not found")
+
             with redis_client.pipeline() as pipe:
                 while True:
                     try:
@@ -157,22 +157,25 @@ def handle_commit_stock(command):
                         current_stock = int(pipe.hget(key, "stock"))
                         if current_stock < quantity:
                             pipe.unwatch()
-                            reply = build_error(command, "Insufficient stock at commit")
-                        reply = build_success(command, {"state": "COMMITTED"})
+                            release_lock(item_id, tx_id)
+                            return build_error(command, "Insufficient stock at commit")
                         pipe.multi()
                         pipe.hincrby(key, "stock", -quantity)
-                        # pipe.set(log_key, json.dumps(reply),  ex=86400)
                         pipe.execute()
                         break
                     except redis.WatchError:
                         continue
-        finally:
+
+        except Exception as e:
             release_lock(item_id, tx_id)
+            return build_error(command, f"DB error during commit: {e}")
+
+        release_lock(item_id, tx_id)
 
     tx["state"] = "COMMITTED"
     tx["updated_at"] = time.time()
     _write_tx(tx_id, tx)
-    return reply
+    return build_success(command, {"state": "COMMITTED"})
 
 
 def handle_abort_stock(command):

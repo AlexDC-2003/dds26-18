@@ -356,24 +356,18 @@ class PaymentKafkaWorker:
             return False, "transaction already aborted"
 
         try:
-            raw2 = self._db.get(tx_key)
-            if not raw2:
-                return True, None
-            tx2 = msgpack.decode(raw2, type=Payment2PCTxValue)
-            if tx2.state == "COMMITTED":
-                return True, None
-            if tx2.state == "ABORTED":
-                return False, "transaction already aborted"
+            raw_user = self._db.get(tx.user_id)
+            if not raw_user:
+                return False, f"User: {tx.user_id} not found"
 
-            raw_user = self._db.get(tx2.user_id)
             user = msgpack.decode(raw_user, type=UserValue)
 
-            user.credit -= tx2.amount
-            tx2.state = "COMMITTED"
-            tx2.credit_after_prepare = user.credit
+            user.credit -= tx.amount
+            tx.state = "COMMITTED"
+            tx.credit_after_prepare = user.credit
             pipe = self._db.pipeline(transaction=True)
-            pipe.set(tx2.user_id, msgpack.encode(user))
-            pipe.set(tx_key, msgpack.encode(tx2))
+            pipe.set(tx.user_id, msgpack.encode(user))
+            pipe.set(tx_key, msgpack.encode(tx))
             pipe.execute()
             return True, None
 

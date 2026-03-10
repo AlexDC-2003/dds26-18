@@ -522,8 +522,8 @@ async def checkout(order_id: str):
                     if stock_reply.status_code != 200:
                         tx.state = TX_ABORTED
                         tx.error = f"Out of stock on item_id: {item_id}"
-                        await _abort_participants(tx)
                         await _save_tx(tx)
+                        await _abort_participants(tx)
                         abort(400, tx.error)
                     _set_prepared_qty(tx, item_id, quantity)
                     tx.stock_prepared = True
@@ -534,8 +534,8 @@ async def checkout(order_id: str):
                     if user_reply.status_code != 200:
                         tx.state = TX_ABORTED
                         tx.error = "User out of credit"
-                        await _abort_participants(tx)
                         await _save_tx(tx)
+                        await _abort_participants(tx)
                         abort(400, tx.error)
                     tx.payment_prepared = True
                     await _save_tx(tx)
@@ -547,7 +547,13 @@ async def checkout(order_id: str):
                 tx.state = TX_COMMITTING
                 await _save_tx(tx)
 
+                deadline = time.time() + COMMIT_RETRY_TIMEOUT_SEC
                 while not (tx.payment_committed and tx.stock_committed):
+                    # if time.time() > deadline:
+                    #     tx.error = "Commit timed out waiting for participants"
+                    #     await _save_tx(tx)
+                    #     abort(503, tx.error)
+
                     if not tx.payment_committed:
                         payment_commit_reply = await commit_payment(tx.tx_id, tx_ts=tx.created_at)
                         if payment_commit_reply.status_code == 200:
@@ -563,6 +569,9 @@ async def checkout(order_id: str):
                         else:
                             tx.error = "Failed to commit stock, retrying"
                         await _save_tx(tx)
+
+                    if not (tx.payment_committed and tx.stock_committed):
+                        await asyncio.sleep(COMMIT_RETRY_SLEEP_SEC)
 
                 tx.error = None
                 await _save_tx(tx)
