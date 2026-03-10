@@ -96,7 +96,7 @@ def _new_tx(command: dict) -> dict:
 def handle_prepare_stock(command):
     item_id = command["payload"].get("item_id")
     quantity = int(command["payload"].get("quantity", 0))
-
+    print(f"Handling prepare_stock for item_id: {item_id}, quantity: {quantity}, tx_id: {command['tx_id']}")
     if not item_id or quantity <= 0:
         return build_error(command, "Invalid payload")
 
@@ -111,15 +111,19 @@ def handle_prepare_stock(command):
     prepared_map = tx.setdefault("items", {})
     already_prepared = int(prepared_map.get(item_id, 0))
     if already_prepared >= quantity:
+        print(f"Idempotent prepare_stock for item_id: {item_id}, already prepared: {already_prepared} in tx_id: {tx_id}")
         return build_success(command, {"item_id": item_id, "prepared": already_prepared, "state": tx.get("state", "PREPARED")})
 
     acquire_lock(item_id, tx_id)
+    print(f"Acquired lock for item_id: {item_id} in tx_id: {tx_id}")
     if not redis_client.exists(key):
+        print(f"Item not found for item_id: {item_id} in tx_id: {tx_id}")
         release_lock(item_id, tx_id)
         return build_error(command, "Item not found")
 
     current_stock = int(redis_client.hget(key, "stock"))
     if current_stock < quantity:
+        print(f"Insufficient stock for item_id: {item_id}, requested: {quantity}, available: {current_stock} in tx_id: {tx_id}")
         release_lock(item_id, tx_id)
         return build_error(command, "Insufficient stock")
 
@@ -127,10 +131,11 @@ def handle_prepare_stock(command):
     tx["state"] = "PREPARED"
     tx["updated_at"] = time.time()
     _write_tx(tx_id, tx)
-
+    print(f"Prepared stock for item_id: {item_id}, quantity: {quantity} in tx_id: {tx_id}")
     return build_success(command, {"item_id": item_id, "prepared": quantity, "state": "PREPARED"})
 
 def handle_commit_stock(command):
+    print(f"Handling commit_stock for tx_id: {command['tx_id']}")
     tx_id = command["tx_id"]
     tx = _read_tx(tx_id)
 
@@ -168,6 +173,7 @@ def handle_commit_stock(command):
 
         except Exception as e:
             release_lock(item_id, tx_id)
+            print(f"DB error during commit for item_id: {item_id} in tx_id: {tx_id}: {e}")
             return build_error(command, f"DB error during commit: {e}")
 
         release_lock(item_id, tx_id)
@@ -175,6 +181,7 @@ def handle_commit_stock(command):
     tx["state"] = "COMMITTED"
     tx["updated_at"] = time.time()
     _write_tx(tx_id, tx)
+    print(f"Committed stock for tx_id: {tx_id}")
     return build_success(command, {"state": "COMMITTED"})
 
 
@@ -195,5 +202,5 @@ def handle_abort_stock(command):
     tx["state"] = "ABORTED"
     tx["updated_at"] = time.time()
     _write_tx(tx_id, tx)
-
+    print(f"Aborted stock transaction for tx_id: {tx_id}")
     return build_success(command, {"state": "ABORTED"})

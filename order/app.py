@@ -31,7 +31,7 @@ db: redis.Redis = redis.Redis(host=os.environ['REDIS_HOST'],
 
 lock_manager = LockManager(db=db)
 INTERNAL_TRANSPORT = os.environ.get("INTERNAL_TRANSPORT", "rest")
-KAFKA_TIMEOUT_SEC = float(os.environ.get("KAFKA_REQUEST_TIMEOUT_SEC", "2"))
+KAFKA_TIMEOUT_SEC = float(os.environ.get("KAFKA_REQUEST_TIMEOUT_SEC", "6"))
 COMMIT_RETRY_TIMEOUT_SEC = float(os.environ.get("KAFKA_COMMIT_RETRY_TIMEOUT_SEC", "8"))
 COMMIT_RETRY_SLEEP_SEC = float(os.environ.get("KAFKA_COMMIT_RETRY_SLEEP_SEC", "0.05"))
 
@@ -479,7 +479,7 @@ async def checkout(order_id: str):
         # Acquire locks first (2PL discipline)
         async with async_2pl(resources, tx_id=tx_id, ts=None):
             # Create/read tx inside lock
-
+            print(f"Acquired locks for order_id: {order_id}, tx_id: {tx_id}")
             tx = await _get_or_create_tx_record(tx_id, order_id, order_entry)
             if tx.state == TX_COMPLETED:
                 return Response("Checkout successful", status=200)
@@ -528,6 +528,7 @@ async def checkout(order_id: str):
                     _set_prepared_qty(tx, item_id, quantity)
                     tx.stock_prepared = True
                     await _save_tx(tx)
+                    print(f"Prepared stock for item_id: {item_id}, quantity: {quantity} in tx_id: {tx.tx_id}")
 
                 if not tx.payment_prepared:
                     user_reply = await prepare_payment(tx.tx_id, tx.user_id, tx.total_cost, tx_ts=tx.created_at)
@@ -539,9 +540,10 @@ async def checkout(order_id: str):
                         abort(400, tx.error)
                     tx.payment_prepared = True
                     await _save_tx(tx)
-
+                    print(f"Prepared payment for user_id: {tx.user_id}, amount: {tx.total_cost} in tx_id: {tx.tx_id}")
                 tx.state = TX_PREPARED
                 await _save_tx(tx)
+                print(f"Transaction prepared for order_id: {order_id}, tx_id: {tx.tx_id}")
 
             if tx.state in (TX_PREPARED, TX_COMMITTING):
                 tx.state = TX_COMMITTING
@@ -558,16 +560,20 @@ async def checkout(order_id: str):
                         payment_commit_reply = await commit_payment(tx.tx_id, tx_ts=tx.created_at)
                         if payment_commit_reply.status_code == 200:
                             tx.payment_committed = True
+                            print(f"Committed payment for user_id: {tx.user_id}, amount: {tx.total_cost} in tx_id: {tx.tx_id}")
                         else:
                             tx.error = "Failed to commit payment, retrying"
+                            print(f"Failed to commit payment for user_id: {tx.user_id}, amount: {tx.total_cost} in tx_id: {tx.tx_id}, retrying")
                         await _save_tx(tx)
 
                     if not tx.stock_committed:
                         stock_commit_reply = await commit_stock(tx.tx_id, tx_ts=tx.created_at)
                         if stock_commit_reply.status_code == 200:
                             tx.stock_committed = True
+                            print(f"Committed stock for order_id: {order_id} in tx_id: {tx.tx_id}")
                         else:
                             tx.error = "Failed to commit stock, retrying"
+                            print(f"Failed to commit stock for order_id: {order_id} in tx_id: {tx.tx_id}, retrying")
                         await _save_tx(tx)
 
                     if not (tx.payment_committed and tx.stock_committed):
@@ -582,7 +588,7 @@ async def checkout(order_id: str):
 
                 tx.state = TX_COMPLETED
                 await _save_tx(tx)
-
+                print(f"Transaction completed for order_id: {order_id}, tx_id: {tx.tx_id}")
             return Response("Checkout successful", status=200)
 
     except WaitDieAbort as e:
