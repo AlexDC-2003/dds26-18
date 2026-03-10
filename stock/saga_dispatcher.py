@@ -135,6 +135,14 @@ def handle_release_stock(command):
     if not item_id or quantity <= 0:
         return build_error(command, "Invalid payload")
 
+    # Guard: only release if a reserve was committed for this tx+item.
+    # Prevents erroneously adding stock for items that were never reserved
+    # (e.g. retry releases sent by the order service on TX_ABORTED reentry).
+    reserve_log_key = f"saga:msg:reserve:{command['tx_id']}:{item_id}"
+    if not redis_client.exists(reserve_log_key):
+        # No committed reserve found — safe no-op
+        return build_success(command, {"item_id": item_id, "released": 0})
+
     key = f"item:{item_id}"
 
     # 2PL growing phase
@@ -142,7 +150,7 @@ def handle_release_stock(command):
     try:
         if not redis_client.exists(key):
             return build_error(command, "Item not found")
-        
+
         reply = build_success(command, {"item_id": item_id, "released": quantity})
 
         with redis_client.pipeline(transaction=True) as pipe:

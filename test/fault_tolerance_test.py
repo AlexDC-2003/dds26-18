@@ -245,9 +245,19 @@ async def main():
         item_ids, user_ids, order_ids = await setup(session)
 
         initial_stock_total  = NUM_ITEMS * ITEM_STOCK
-        initial_credit_total = NUM_USERS * USER_CREDIT
+
+        # Measure actual initial credit from DB (add_funds may silently fail)
+        _sem = asyncio.Semaphore(50)
+        async def _get_credit(uid):
+            async with _sem:
+                sc, j = await aget(session, f"/payment/find_user/{uid}")
+                return j["credit"]
+        _credits = await asyncio.gather(*[_get_credit(uid) for uid in user_ids])
+        initial_credit_total = sum(_credits)
+
         print(f"  orders={len(order_ids)}  total_stock={initial_stock_total}"
-              f"  total_credit={initial_credit_total}")
+              f"  total_credit={initial_credit_total}"
+              f"  (expected {NUM_USERS * USER_CREDIT})")
 
         # ── Phase 2: Load + fault injection ──────────────────────
         print(f"\n[Phase 2] Killing containers immediately + running load...")

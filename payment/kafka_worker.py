@@ -1,9 +1,12 @@
 import asyncio
 import json
+import logging
 import os
 import threading
 import time
 from typing import Any, Dict, Optional, Tuple
+
+logger = logging.getLogger(__name__)
 
 import redis
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
@@ -220,7 +223,7 @@ class PaymentKafkaWorker:
             if typ == "charge_user":
                 user_id = str(payload.get("user_id", ""))
                 amount = int(payload.get("amount", 0))
-                ok, err, new_credit = self._charge_user(tx_id, user_id, amount, tx_ts=tx_ts)
+                ok, err, new_credit = self._charge_user(tx_id, user_id, amount, msg_id=msg_id, tx_ts=tx_ts)
                 if ok:
                     base["status_code"] = 200
                     base["payload"] = {"user_id": user_id, "amount": amount, "credit": new_credit}
@@ -231,7 +234,7 @@ class PaymentKafkaWorker:
             if typ == "refund_user":
                 user_id = str(payload.get("user_id", ""))
                 amount = int(payload.get("amount", 0))
-                ok, err, new_credit = self._refund_user(tx_id, user_id, amount, tx_ts=tx_ts)
+                ok, err, new_credit = self._refund_user(tx_id, user_id, amount, msg_id=msg_id, tx_ts=tx_ts)
                 if ok:
                     base["status_code"] = 200
                     base["payload"] = {"user_id": user_id, "amount": amount, "credit": new_credit}
@@ -261,6 +264,7 @@ class PaymentKafkaWorker:
         user_id: str,
         amount: int,
         *,
+        msg_id: str,
         tx_ts: Optional[float] = None,
     ) -> Tuple[bool, Optional[str], Optional[int]]:
         if not user_id:
@@ -268,19 +272,21 @@ class PaymentKafkaWorker:
         if amount <= 0:
             return False, "amount must be > 0", None
 
-        tx_key = f"pay_tx:{tx_id}"
+        tx_key = f"pay_tx:{msg_id}"
+        logger.info("[CHARGE] msg_id=%s tx_id=%s user=%s amount=%s", msg_id, tx_id, user_id, amount)
 
         # Fast idempotency check (no lock needed — tx record is immutable once written).
         existing = self._db.get(tx_key)
         if existing:
             tx = msgpack.decode(existing, type=ChargeTxValue)
+            logger.info("[CHARGE:IDEMPOTENT] msg_id=%s user=%s credit_after=%s", msg_id, user_id, tx.credit_after)
             return True, None, tx.credit_after
 
         # Resources we need to lock (sorted inside transaction_context too, but
         # explicit ordering here makes the intent clear):
         #   1. user record
-        #   2. idempotency key for this transaction
-        resources = [f"user:{user_id}", f"pay_tx:{tx_id}"]
+        #   2. idempotency key for this message
+        resources = [f"user:{user_id}", f"pay_tx:{msg_id}"]
 
         try:
             with transaction_context(
@@ -295,6 +301,7 @@ class PaymentKafkaWorker:
                 existing2 = self._db.get(tx_key)
                 if existing2:
                     tx = msgpack.decode(existing2, type=ChargeTxValue)
+                    logger.info("[CHARGE:IDEMPOTENT-LOCKED] msg_id=%s user=%s credit_after=%s", msg_id, user_id, tx.credit_after)
                     return True, None, tx.credit_after
 
                 raw_user = self._db.get(user_id)
@@ -315,14 +322,18 @@ class PaymentKafkaWorker:
                 pipe.set(user_id, msgpack.encode(user))
                 pipe.set(tx_key, msgpack.encode(tx_record))
                 pipe.execute()
+                logger.info("[CHARGE:COMMITTED] msg_id=%s tx_id=%s user=%s amount=%s credit_after=%s", msg_id, tx_id, user_id, amount, user.credit)
 
                 return True, None, user.credit
 
         except WaitDieAbort as e:
+            logger.warning("[CHARGE:ABORTED] msg_id=%s tx_id=%s user=%s reason=wait-die: %s", msg_id, tx_id, user_id, e)
             return False, f"wait-die abort: {e}", None
         except LockTimeout as e:
+            logger.warning("[CHARGE:ABORTED] msg_id=%s tx_id=%s user=%s reason=lock-timeout: %s", msg_id, tx_id, user_id, e)
             return False, f"lock timeout: {e}", None
         except redis.exceptions.RedisError as e:
+            logger.error("[CHARGE:ERROR] msg_id=%s tx_id=%s user=%s error=%s", msg_id, tx_id, user_id, e)
             return False, f"DB error: {e}", None
 
     def _refund_user(
@@ -331,6 +342,7 @@ class PaymentKafkaWorker:
         user_id: str,
         amount: int,
         *,
+        msg_id: str,
         tx_ts: Optional[float] = None,
     ) -> Tuple[bool, Optional[str], Optional[int]]:
         if not user_id:
@@ -338,8 +350,9 @@ class PaymentKafkaWorker:
         if amount <= 0:
             return False, "amount must be > 0", None
 
-        charge_tx_key = f"pay_tx:{tx_id}"
-        refund_tx_key = f"refund_tx:{tx_id}"
+        # Reconstruct the charge's idempotency key: charge msg_id = f"charge:{tx_id}:{user_id}"
+        charge_tx_key = f"pay_tx:charge:{tx_id}:{user_id}"
+        refund_tx_key = f"refund_tx:{msg_id}"
 
         # Fast idempotency check — already refunded.
         existing_refund = self._db.get(refund_tx_key)
@@ -352,7 +365,7 @@ class PaymentKafkaWorker:
         if not existing_charge:
             return True, None, None
 
-        resources = [f"user:{user_id}", f"refund_tx:{tx_id}"]
+        resources = [f"user:{user_id}", f"refund_tx:{msg_id}"]
 
         try:
             with transaction_context(
@@ -385,6 +398,7 @@ class PaymentKafkaWorker:
                 pipe.set(user_id, msgpack.encode(user))
                 pipe.set(refund_tx_key, msgpack.encode(tx_record))
                 pipe.execute()
+                print(f"[IDEMPOTENCY] wrote key={refund_tx_key}")
 
                 return True, None, user.credit
 

@@ -327,26 +327,28 @@ async def release_stock(tx_id: str, item_id: str, quantity: int):
     reply = await kafka_bus.request(os.environ["KAFKA_STOCK_COMMANDS_TOPIC"], cmd, timeout_sec=KAFKA_TIMEOUT_SEC)
     return _as_response_like(reply, service="stock")
 
-async def charge_user(tx_id: str, user_id: str, amount: int | float):
+async def charge_user(tx_id: str, user_id: str, amount: int | float, tx_ts: float = None):
     if INTERNAL_TRANSPORT != "kafka":
         return await http_post(f"{GATEWAY_URL}/payment/pay/{user_id}/{amount}")
 
     cmd = {
-        "msg_id": str(uuid.uuid4()),
+        "msg_id": f"charge:{tx_id}:{user_id}",
         "tx_id": tx_id,
+        "tx_ts": tx_ts,
         "type": "charge_user",
         "payload": {"user_id": user_id, "amount": amount},
     }
     reply = await kafka_bus.request(os.environ["KAFKA_PAYMENT_COMMANDS_TOPIC"], cmd, timeout_sec=KAFKA_TIMEOUT_SEC)
     return _as_response_like(reply, service="payment")
 
-async def refund_user(tx_id: str, user_id: str, amount: int | float):
+async def refund_user(tx_id: str, user_id: str, amount: int | float, tx_ts: float = None):
     if INTERNAL_TRANSPORT != "kafka":
         return await http_post(f"{GATEWAY_URL}/payment/add_funds/{user_id}/{amount}")
 
     cmd = {
-        "msg_id": str(uuid.uuid4()),
+        "msg_id": f"refund:{tx_id}:{user_id}",
         "tx_id": tx_id,
+        "tx_ts": tx_ts,
         "type": "refund_user",
         "payload": {"user_id": user_id, "amount": amount},
     }
@@ -449,9 +451,17 @@ async def checkout(order_id: str):
             
             tx = await _get_or_create_tx_record(tx_id, order_id, order_entry)
             if tx.state == TX_COMPLETED:
+                # Re-apply paid=True in case the order-db write was lost
+                # (tx state survived the crash but order.paid did not)
+                order_entry = await get_order_from_db(order_id)
+                if not order_entry.paid:
+                    logging.warning("[TX:REPAID] order=%s tx=%s — paid flag was lost, re-writing", order_id, tx.tx_id)
+                    order_entry.paid = True
+                    await rset(order_id, msgpack.encode(order_entry))
                 return Response("Checkout successful", status=200)
             if tx.state == TX_ABORTED:
                 # Retry any rollback that failed in a previous attempt before discarding this tx
+                logging.info("[TX:ABORTED-REENTRY] order=%s old_tx=%s error=%s reserved=%s", order_id, tx.tx_id, tx.error, tx.reserved_items)
                 if tx.reserved_items:
                     await rollback_stock(tx)
                     await _save_tx(tx)
@@ -461,7 +471,31 @@ async def checkout(order_id: str):
                     tx.stock_released = True
                     await _save_tx(tx)
 
+                # Always re-attempt release for all items using the old tx_id, even when
+                # reserved_items=[] and stock_released=True (order-db may have saved the
+                # cleared state but stock-db lost the commit due to AOF loss within the
+                # everysec fsync window). Stock service guards against releasing un-reserved
+                # items (checks for a committed reserve key before adding stock back).
+                for item_id_old, qty_old in tx.items:
+                    try:
+                        await release_stock(tx.tx_id, item_id_old, qty_old)
+                    except Exception:
+                        pass
+
+                # Refund in case the charge committed before the abort
+                # (e.g. Kafka reply timeout or Redis connection error after EXEC).
+                # _refund_user is a no-op if no charge record exists.
+                if not tx.payment_refunded:
+                    refund_reply = await refund_user(tx.tx_id, tx.user_id, tx.total_cost, tx_ts=tx.created_at)
+                    if refund_reply.status_code not in (200, 400):
+                        # Transient error — force client to retry so refund can complete
+                        abort(503, "Compensating refund in progress, please retry")
+                    tx.payment_refunded = True
+                    await _save_tx(tx)
+                    logging.info("[TX:ABORTED-REFUNDED] order=%s old_tx=%s", order_id, tx.tx_id)
+
                 tx_id = str(uuid.uuid4())                        # new tx_id
+                logging.info("[TX:NEW-ID] order=%s new_tx=%s", order_id, tx_id)
                 await rset(_order_tx_key(order_id), tx_id)       # overwrite order_tx:{order_id}
                 now = time.time()
                 tx = OrderTxValue(
@@ -514,8 +548,10 @@ async def checkout(order_id: str):
                 await _save_tx(tx)
 
             if tx.state == TX_STOCK_RESERVED and not tx.payment_done:
-                user_reply = await charge_user(tx.tx_id, tx.user_id, tx.total_cost)
+                logging.info("[TX:CHARGING] order=%s tx=%s user=%s amount=%s", order_id, tx.tx_id, tx.user_id, tx.total_cost)
+                user_reply = await charge_user(tx.tx_id, tx.user_id, tx.total_cost, tx_ts=tx.created_at)
                 if user_reply.status_code != 200:
+                    logging.warning("[TX:CHARGE-FAILED] order=%s tx=%s user=%s status=%s", order_id, tx.tx_id, tx.user_id, user_reply.status_code)
                     if not tx.stock_released:
                         await rollback_stock(tx)
                         if not tx.reserved_items:
@@ -527,6 +563,7 @@ async def checkout(order_id: str):
                     await _save_tx(tx)
                     abort(400, tx.error)
 
+                logging.info("[TX:CHARGED] order=%s tx=%s user=%s amount=%s", order_id, tx.tx_id, tx.user_id, tx.total_cost)
                 tx.payment_done = True
                 tx.state = TX_PAYMENT_DONE
                 await _save_tx(tx)
