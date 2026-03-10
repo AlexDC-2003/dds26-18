@@ -289,6 +289,7 @@ class PaymentKafkaWorker:
         *,
         tx_ts: Optional[float] = None,
     ) -> Tuple[bool, Optional[str], Optional[int]]:
+        print(f"Handling prepare_payment for user_id: {user_id}, amount: {amount}, tx_id: {tx_id}")
         if not user_id:
             return False, "missing user_id", None
         if amount <= 0:
@@ -302,11 +303,14 @@ class PaymentKafkaWorker:
             tx = msgpack.decode(existing, type=Payment2PCTxValue)
             if tx.state == "ABORTED":
                 return False, "transaction already aborted", None
+            print(f"Idempotent prepare_payment for user_id: {user_id}, already prepared in tx_id: {tx_id}")
             return True, None, tx.credit_after_prepare
 
         lock_ok, lock_err = self._acquire_user_lock(tx_id, user_id, tx_ts=tx_ts)
         if not lock_ok:
+            print(f"[2PL] Failed to acquire lock for user_id: {user_id} in tx_id: {tx_id}: {lock_err}")
             return False, lock_err, None
+        print(f"Acquired lock for user_id: {user_id} in tx_id: {tx_id}")
 
         try:
             existing2 = self._db.get(tx_key)
@@ -314,15 +318,18 @@ class PaymentKafkaWorker:
                 tx = msgpack.decode(existing2, type=Payment2PCTxValue)
                 if tx.state == "ABORTED":
                     return False, "transaction already aborted", None
+                print(f"Idempotent prepare_payment for user_id: {user_id}, already prepared in tx_id: {tx_id}")
                 return True, None, tx.credit_after_prepare
 
             raw_user = self._db.get(user_id)
             if not raw_user:
+                print(f"User not found for user_id: {user_id} in tx_id: {tx_id}")
                 self._release_tx_locks(tx_id)
                 return False, f"User: {user_id} not found!", None
 
             user = msgpack.decode(raw_user, type=UserValue)
             if user.credit < amount:
+                print(f"Insufficient credit for user_id: {user_id}, requested: {amount}, available: {user.credit} in tx_id: {tx_id}")
                 self._release_tx_locks(tx_id)
                 return False, "User out of credit", None
 
@@ -334,6 +341,7 @@ class PaymentKafkaWorker:
                 ts=time.time(),
             )
             self._db.set(tx_key, msgpack.encode(tx_record))
+            print(f"Prepared payment for user_id: {user_id}, amount: {amount} in tx_id: {tx_id}")
             return True, None, user.credit
         except redis.exceptions.RedisError as e:
             self._release_tx_locks(tx_id)
