@@ -49,6 +49,9 @@ def stock_dispatcher(command):
     if msg_type == "release_stock":
         item_id = command["payload"].get("item_id", "")
         log_key = f"saga:release:{command['tx_id']}:{item_id}"
+    elif msg_type == "reserve_stock":
+        item_id = command["payload"].get("item_id", "")
+        log_key = f"saga:msg:reserve:{command['tx_id']}:{item_id}"
     else:
         log_key = f"saga:msg:{msg_id}"
 
@@ -89,7 +92,7 @@ def stock_dispatcher(command):
 def handle_reserve_stock(command):
     item_id = command["payload"].get("item_id")
     quantity = int(command["payload"].get("quantity", 0))
-    log_key = f"saga:msg:{command['msg_id']}"
+    log_key = f"saga:msg:reserve:{command['tx_id']}:{item_id}"
 
     if not item_id or quantity <= 0:
         return build_error(command, "Invalid payload")
