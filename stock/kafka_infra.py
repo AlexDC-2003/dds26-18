@@ -94,7 +94,7 @@ class StockKafkaInfrastructure:
             self._commands_topic,
             bootstrap_servers=self._bootstrap,
             group_id=self._group_id,
-            enable_auto_commit=False,
+            enable_auto_commit=True,
             auto_offset_reset="earliest",
             value_deserializer=lambda b: json.loads(b.decode("utf-8")),
         )
@@ -122,37 +122,34 @@ class StockKafkaInfrastructure:
 
         async for msg in self._consumer:
             command = msg.value
-            # Run blocking dispatcher in executor so the event loop stays unblocked
-            #loop = asyncio.get_event_loop()
-            reply = self.dispatcher(command)
-            #await loop.run_in_executor(None, self._dispatch_with_retry, command)
+            asyncio.create_task(self._process_one(command))
+
+    async def _process_one(self, command: Dict[str, Any]) -> None:
+        loop = asyncio.get_running_loop()
+        backoff = 0.1
+        reply = None
+
+        for attempt in range(1, MAX_RETRIES + 1):
             try:
-                await self._producer.send_and_wait(self._replies_topic, reply)
-                await self._consumer.commit()
-            except Exception as send_err:
-                print(f"Failed to send error reply: {send_err}")
-                continue
+                reply = await loop.run_in_executor(None, self.dispatcher, command)
+                break
+            except (WaitDieAbort, LockTimeout) as e:
+                if attempt < MAX_RETRIES:
+                    print(f"[2PL] Wait-Die retry {attempt}/{MAX_RETRIES} for msg_id={command.get('msg_id')}")
+                    await asyncio.sleep(backoff)
+                    backoff = min(backoff * 2, 5.0)
+                else:
+                    print(f"[2PL] All {MAX_RETRIES} retries exhausted for msg_id={command.get('msg_id')}")
+                    reply = {"msg_id": command.get("msg_id"), "tx_id": command.get("tx_id"), "ok": False, "error": str(e)}
+            except Exception as e:
+                print(f"Error processing command: {e}")
+                reply = {"msg_id": command.get("msg_id"), "tx_id": command.get("tx_id"), "ok": False, "error": str(e)}
+                break
 
+        if reply is None:
+            reply = {"msg_id": command.get("msg_id"), "tx_id": command.get("tx_id"), "ok": False, "error": "no reply"}
 
-
-    # def _dispatch_with_retry(self, command: Dict[str, Any]) -> Dict[str, Any]:
-    #     # Retry on wait-die abort/timeout (dispatcher already sleeps a random back-off before re-raising).
-    #     backoff = 1.0
-
-    #     for attempt in range(1, MAX_RETRIES + 1):
-    #         try:
-    #             return self.dispatcher(command)
-    #         except (WaitDieAbort, LockTimeout) as e:
-    #             if attempt < MAX_RETRIES:
-    #                 print(f"[2PL] Wait-Die retry {attempt}/{MAX_RETRIES} for msg_id={command.get('msg_id')}")
-    #                 backoff = min(backoff * 2, 30.0)
-    #                 # await asyncio.sleep(backoff)
-    #             else:
-    #                 print(f"[2PL] All {MAX_RETRIES} retries exhausted for msg_id={command.get('msg_id')}")
-    #                 return {"msg_id": command.get("msg_id"), "tx_id": command.get("tx_id"), "ok": False, "error": str(e)}
-    #         except Exception as e:
-    #             print(f"Error processing command: {e}")
-    #             try:
-    #                 return {"msg_id": command.get("msg_id"), "tx_id": command.get("tx_id"), "ok": False, "error": str(e)}
-    #             except Exception as send_err:
-    #                 print(f"Failed to send error reply: {send_err}")
+        try:
+            await self._producer.send_and_wait(self._replies_topic, reply)
+        except Exception as send_err:
+            print(f"Failed to send reply: {send_err}")

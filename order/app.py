@@ -321,7 +321,7 @@ async def commit_stock(tx_id: str, *, tx_ts: float):
         return SimpleNamespace(status_code=400, json=lambda: {"error": "2PC requires Kafka transport"})
 
     cmd = {
-        "msg_id": str(uuid.uuid4()),
+        "msg_id": f"commit_stock:{tx_id}",
         "tx_id": tx_id,
         "tx_ts": tx_ts,
         "type": "commit_stock",
@@ -335,7 +335,7 @@ async def abort_stock(tx_id: str, *, tx_ts: float):
         return SimpleNamespace(status_code=400, json=lambda: {"error": "2PC requires Kafka transport"})
 
     cmd = {
-        "msg_id": str(uuid.uuid4()),
+        "msg_id": f"abort_stock:{tx_id}",
         "tx_id": tx_id,
         "tx_ts": tx_ts,
         "type": "abort_stock",
@@ -349,7 +349,7 @@ async def prepare_payment(tx_id: str, user_id: str, amount: int | float, *, tx_t
         return SimpleNamespace(status_code=400, json=lambda: {"error": "2PC requires Kafka transport"})
 
     cmd = {
-        "msg_id": str(uuid.uuid4()),
+        "msg_id": f"prepare_payment:{tx_id}:{user_id}",
         "tx_id": tx_id,
         "tx_ts": tx_ts,
         "type": "prepare_payment",
@@ -363,7 +363,7 @@ async def commit_payment(tx_id: str, *, tx_ts: float):
         return SimpleNamespace(status_code=400, json=lambda: {"error": "2PC requires Kafka transport"})
 
     cmd = {
-        "msg_id": str(uuid.uuid4()),
+        "msg_id": f"commit_payment:{tx_id}",
         "tx_id": tx_id,
         "tx_ts": tx_ts,
         "type": "commit_payment",
@@ -377,7 +377,7 @@ async def abort_payment(tx_id: str, *, tx_ts: float):
         return SimpleNamespace(status_code=400, json=lambda: {"error": "2PC requires Kafka transport"})
 
     cmd = {
-        "msg_id": str(uuid.uuid4()),
+        "msg_id": f"abort_payment:{tx_id}",
         "tx_id": tx_id,
         "tx_ts": tx_ts,
         "type": "abort_payment",
@@ -521,7 +521,7 @@ async def checkout(order_id: str):
                     stock_reply = await prepare_stock(tx.tx_id, item_id, quantity, tx_ts=tx.created_at)
                     if stock_reply.status_code != 200:
                         tx.state = TX_ABORTED
-                        tx.error = f"Out of stock on item_id: {item_id}"
+                        tx.error = stock_reply.json #f"Out of stock on item_id: {item_id}"
                         await _save_tx(tx)
                         await _abort_participants(tx)
                         abort(400, tx.error)
@@ -551,10 +551,10 @@ async def checkout(order_id: str):
 
                 deadline = time.time() + COMMIT_RETRY_TIMEOUT_SEC
                 while not (tx.payment_committed and tx.stock_committed):
-                    # if time.time() > deadline:
-                    #     tx.error = "Commit timed out waiting for participants"
-                    #     await _save_tx(tx)
-                    #     abort(503, tx.error)
+                    if time.time() > deadline:
+                        tx.error = "Commit timed out waiting for participants"
+                        await _save_tx(tx)
+                        abort(503, tx.error)
 
                     if not tx.payment_committed:
                         payment_commit_reply = await commit_payment(tx.tx_id, tx_ts=tx.created_at)

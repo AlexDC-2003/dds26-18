@@ -20,7 +20,7 @@ ITEMS_PER_USER = 2
 
 ITEM_PRICE = 10
 USER_CREDIT = 100
-TOTAL_STOCK = 1000 #USERS_COUNT * ITEMS_PER_USER
+TOTAL_STOCK = USERS_COUNT * ITEMS_PER_USER
 
 
 async def _parse(r):
@@ -87,7 +87,7 @@ async def main():
         # Setup
         print("\n[Setup]")
         item_id, user_ids, order_ids = await setup(session)
-        return
+    
         # Concurrent checkout
         print("\n[Test] All 5 users checkout concurrently...")
         results = await checkout_concurrently(session, order_ids)

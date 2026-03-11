@@ -118,6 +118,8 @@ def handle_prepare_stock(command):
     lock_ok, lock_error = acquire_lock(item_id, tx_id)
     if not lock_ok:
         print(f"Failed to acquire lock for item_id: {item_id} in tx_id: {tx_id}: {lock_error}")
+        if lock_error and "wait-die" in lock_error:
+            raise WaitDieAbort(lock_error)
         return build_error(command, lock_error)
     print(f"Acquired lock for item_id: {item_id} in tx_id: {tx_id}")
     if not redis_client.exists(key):
