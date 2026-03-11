@@ -521,7 +521,8 @@ async def checkout(order_id: str):
                     stock_reply = await prepare_stock(tx.tx_id, item_id, quantity, tx_ts=tx.created_at)
                     if stock_reply.status_code != 200:
                         tx.state = TX_ABORTED
-                        tx.error = stock_reply.json #f"Out of stock on item_id: {item_id}"
+                        error_body = stock_reply.json() 
+                        tx.error = error_body.get("error") or f"Default error message on item {item_id}" #f"Out of stock on item_id: {item_id}"
                         await _save_tx(tx)
                         await _abort_participants(tx)
                         abort(400, tx.error)
