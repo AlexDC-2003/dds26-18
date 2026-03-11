@@ -65,6 +65,7 @@ def acquire_lock(item_id: str, tx_id: str, *, tx_ts: Optional[float] = None) -> 
     if _redis_client is None:
         raise RuntimeError("Redis client is not configured for lock manager")
 
+    # requester_ts = tx_ts if tx_ts is not None else time.time()
     requester_ts = time.time()
     lock_key = f"lock:item:{item_id}"
     lock_value = _encode_lock_value(tx_id, requester_ts)

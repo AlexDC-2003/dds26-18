@@ -182,11 +182,15 @@ def handle_commit_stock(command):
             print(f"DB error during commit for item_id: {item_id} in tx_id: {tx_id}: {e}")
             return build_error(command, f"DB error during commit: {e}")
 
-        release_lock(item_id, tx_id)
+        # release_lock(item_id, tx_id)
 
     tx["state"] = "COMMITTED"
     tx["updated_at"] = time.time()
     _write_tx(tx_id, tx)
+
+    for item_id in sorted(items.keys()):
+        release_lock(item_id, tx_id)
+
     print(f"Committed stock for tx_id: {tx_id}; item id: {item_id}, quantity: {quantity}")
     return build_success(command, {"state": "COMMITTED"})
 
