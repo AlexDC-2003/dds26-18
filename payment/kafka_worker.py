@@ -377,6 +377,7 @@ class PaymentKafkaWorker:
             pipe.set(tx.user_id, msgpack.encode(user))
             pipe.set(tx_key, msgpack.encode(tx))
             pipe.execute()
+            print(f"Committed payment for user_id: {tx.user_id}, amount: {tx.amount} in tx_id: {tx_id}")
             return True, None
 
         except redis.exceptions.RedisError as e:

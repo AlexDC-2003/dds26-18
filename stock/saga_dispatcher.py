@@ -185,7 +185,7 @@ def handle_commit_stock(command):
     tx["state"] = "COMMITTED"
     tx["updated_at"] = time.time()
     _write_tx(tx_id, tx)
-    print(f"Committed stock for tx_id: {tx_id}")
+    print(f"Committed stock for tx_id: {tx_id}; item id: {item_id}, quantity: {quantity}")
     return build_success(command, {"state": "COMMITTED"})
 
 
