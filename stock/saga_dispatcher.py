@@ -1,8 +1,9 @@
+import asyncio
 import json
 import time
 import redis
 
-from lock_manager import acquire_lock, release_lock, random_backoff, LockDeadlockAbort
+from lock_manager import acquire_lock, release_lock, random_backoff, WaitDieAbort, LockTimeout
 redis_client = None
 
 
@@ -56,10 +57,10 @@ def stock_dispatcher(command):
 
         else:
             reply = build_error(command, f"Unknown command type: {msg_type}")
-    except LockDeadlockAbort as e:
-        # Assumed deadlock — sleep a random back-off then re-raise so kafka_bus can retry the command
-        print(f"[2PL] Deadlock abort for tx {command.get('tx_id')}: {e}")
-        time.sleep(random_backoff())
+    except (WaitDieAbort, LockTimeout) as e:
+        # Sleep a random back-off then re-raise so kafka_infra can retry the command.
+        print(f"[2PL] Wait-Die abort for tx {command.get('tx_id')}")
+        # await asyncio.sleep(random_backoff())
         raise
 
     return reply
@@ -114,7 +115,10 @@ def handle_prepare_stock(command):
         print(f"Idempotent prepare_stock for item_id: {item_id}, already prepared: {already_prepared} in tx_id: {tx_id}")
         return build_success(command, {"item_id": item_id, "prepared": already_prepared, "state": tx.get("state", "PREPARED")})
 
-    acquire_lock(item_id, tx_id)
+    lock_ok, lock_error = acquire_lock(item_id, tx_id)
+    if not lock_ok:
+        print(f"Failed to acquire lock for item_id: {item_id} in tx_id: {tx_id}: {lock_error}")
+        return build_error(command, lock_error)
     print(f"Acquired lock for item_id: {item_id} in tx_id: {tx_id}")
     if not redis_client.exists(key):
         print(f"Item not found for item_id: {item_id} in tx_id: {tx_id}")

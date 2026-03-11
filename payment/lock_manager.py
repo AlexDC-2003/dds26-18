@@ -131,6 +131,7 @@ class LockManager:
             # ---------- attempt atomic acquisition ----------
             # SET NX returns True if the key was absent and we wrote it;
             # False if the key already existed (someone else holds the lock).
+            requester_ts = time.time()
             granted = self._db.set(lock_key, lock_value, nx=True, px=ttl_ms)
 
             if granted:
@@ -152,10 +153,10 @@ class LockManager:
                 return
 
             # ---------- apply Wait-Die rule ----------
-            if txn.ts > holder_ts:
+            if requester_ts > holder_ts:
                 # We are YOUNGER than the holder → DIE.
                 raise WaitDieAbort(
-                    f"Wait-Die: tx {txn.tx_id} (ts={txn.ts:.6f}) is younger than "
+                    f"Wait-Die: tx {txn.tx_id} (ts={requester_ts:.6f}) is younger than "
                     f"holder tx {holder_tx_id} (ts={holder_ts:.6f}) "
                     f"for resource '{resource}' — aborting."
                 )
