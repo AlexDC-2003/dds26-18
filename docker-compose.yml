@@ -25,7 +25,7 @@ services:
       - INTERNAL_TRANSPORT=kafka  
       - KAFKA_REQUEST_TIMEOUT_SEC=2
       - KAFKA_ORDER_GROUP_ID=order-service
-    command: hypercorn -b 0.0.0.0:5000 --workers 1 app:app
+    command: hypercorn -b 0.0.0.0:5000 --workers 4 app:app
     env_file:
       - env/order_redis.env
     depends_on:
@@ -52,7 +52,7 @@ services:
       - KAFKA_STOCK_COMMANDS_TOPIC=stock.commands
       - KAFKA_STOCK_REPLIES_TOPIC=stock.replies
       - KAFKA_ORDER_EVENTS_TOPIC=order.events
-    command: gunicorn -b 0.0.0.0:5000 -w 1 --timeout 30 --log-level=info app:app
+    command: gunicorn -b 0.0.0.0:5000 -w 3 --timeout 30 --log-level=info app:app
     env_file:
       - env/stock_redis.env
     depends_on:
@@ -81,7 +81,7 @@ services:
       - KAFKA_PAYMENT_REPLIES_TOPIC=payment.replies
       - KAFKA_PAYMENT_GROUP_ID=payment-service
       - KAFKA_ORDER_EVENTS_TOPIC=order.events
-    command: gunicorn -b 0.0.0.0:5000 -w 1 --timeout 30 --log-level=info app:app
+    command: gunicorn -b 0.0.0.0:5000 -w 3 --timeout 30 --log-level=info app:app
     env_file:
       - env/payment_redis.env
     depends_on:

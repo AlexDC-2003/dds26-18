@@ -178,23 +178,24 @@ class PaymentKafkaWorker:
         async for msg in self._consumer:
             if self._stop_evt.is_set():
                 break
-
             try:
                 cmd = json.loads(msg.value.decode("utf-8"))
             except Exception:
-                await self._consumer.commit()
                 continue
-
-            reply = self._handle_command(cmd)
-
+            await self._process_one(cmd)
             try:
-                payload = json.dumps(reply).encode("utf-8")
-                await self._producer.send_and_wait(self._replies_topic, payload)
                 await self._consumer.commit()
-            except Exception:
-                # If we fail to publish the reply, client may timeout and retry.
-                # Our operations are idempotent on success.
-                continue
+            except Exception as commit_err:
+                print(f"Failed to commit Kafka offset: {commit_err}")
+
+    async def _process_one(self, cmd: Dict[str, Any]) -> None:
+        loop = asyncio.get_running_loop()
+        try:
+            reply = await loop.run_in_executor(None, self._handle_command, cmd)
+            payload = json.dumps(reply).encode("utf-8")
+            await self._producer.send_and_wait(self._replies_topic, payload)
+        except Exception as e:
+            print(f"Failed to process/send payment reply: {e}")
 
     def _handle_command(self, cmd: Dict[str, Any]) -> Dict[str, Any]:
         msg_id = cmd.get("msg_id")
@@ -273,11 +274,15 @@ class PaymentKafkaWorker:
             return False, "amount must be > 0", None
 
         tx_key = f"pay_tx:{msg_id}"
+        # Refund key written by _refund_user for this same tx_id.
+        # If it exists the charge was already reversed, so a retry must
+        # re-charge rather than return the stale idempotency record.
+        refund_key = f"refund_tx:refund:{tx_id}:{user_id}"
         logger.info("[CHARGE] msg_id=%s tx_id=%s user=%s amount=%s", msg_id, tx_id, user_id, amount)
 
         # Fast idempotency check (no lock needed — tx record is immutable once written).
         existing = self._db.get(tx_key)
-        if existing:
+        if existing and not self._db.get(refund_key):
             tx = msgpack.decode(existing, type=ChargeTxValue)
             logger.info("[CHARGE:IDEMPOTENT] msg_id=%s user=%s credit_after=%s", msg_id, user_id, tx.credit_after)
             return True, None, tx.credit_after
@@ -299,7 +304,7 @@ class PaymentKafkaWorker:
 
                 # Re-check idempotency under lock.
                 existing2 = self._db.get(tx_key)
-                if existing2:
+                if existing2 and not self._db.get(refund_key):
                     tx = msgpack.decode(existing2, type=ChargeTxValue)
                     logger.info("[CHARGE:IDEMPOTENT-LOCKED] msg_id=%s user=%s credit_after=%s", msg_id, user_id, tx.credit_after)
                     return True, None, tx.credit_after
@@ -321,6 +326,9 @@ class PaymentKafkaWorker:
                 pipe = self._db.pipeline(transaction=True)
                 pipe.set(user_id, msgpack.encode(user))
                 pipe.set(tx_key, msgpack.encode(tx_record))
+                # Clear the refund key so this re-charge is not repeated on
+                # the next idempotency check (only bypass once per refund).
+                pipe.delete(refund_key)
                 pipe.execute()
                 logger.info("[CHARGE:COMMITTED] msg_id=%s tx_id=%s user=%s amount=%s credit_after=%s", msg_id, tx_id, user_id, amount, user.credit)
 

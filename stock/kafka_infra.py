@@ -121,30 +121,38 @@ class StockKafkaInfrastructure:
         assert self._producer is not None
 
         async for msg in self._consumer:
-            command = msg.value
-            # Run blocking dispatcher in executor so the event loop stays unblocked
-            loop = asyncio.get_event_loop()
-            reply = await loop.run_in_executor(None, self._dispatch_with_retry, command)
+            await self._process_one(msg.value)
             try:
-                await self._producer.send_and_wait(self._replies_topic, reply)
                 await self._consumer.commit()
-            except Exception as send_err:
-                print(f"Failed to send error reply: {send_err}")
+            except Exception as commit_err:
+                print(f"Failed to commit Kafka offset: {commit_err}")
 
-    def _dispatch_with_retry(self, command: Dict[str, Any]) -> Dict[str, Any]:
-        # Retry on deadlock abort (dispatcher already sleeps a random back-off before re-raising)
+    async def _process_one(self, command: Dict[str, Any]) -> None:
+        loop = asyncio.get_running_loop()
+        backoff = 0.1
+        reply = None
+
         for attempt in range(1, MAX_RETRIES + 1):
             try:
-                return self.dispatcher(command)
+                reply = await loop.run_in_executor(None, self.dispatcher, command)
+                break
             except LockDeadlockAbort as e:
                 if attempt < MAX_RETRIES:
                     print(f"[2PL] Deadlock retry {attempt}/{MAX_RETRIES} for msg_id={command.get('msg_id')}")
+                    await asyncio.sleep(backoff)
+                    backoff = min(backoff * 2, 5.0)
                 else:
                     print(f"[2PL] All {MAX_RETRIES} retries exhausted for msg_id={command.get('msg_id')}")
-                    return {"msg_id": command.get("msg_id"), "tx_id": command.get("tx_id"), "ok": False, "error": str(e)}
+                    reply = {"msg_id": command.get("msg_id"), "tx_id": command.get("tx_id"), "ok": False, "error": str(e)}
             except Exception as e:
                 print(f"Error processing command: {e}")
-                try:
-                    return {"msg_id": command.get("msg_id"), "tx_id": command.get("tx_id"), "ok": False, "error": str(e)}
-                except Exception as send_err:
-                    print(f"Failed to send error reply: {send_err}")
+                reply = {"msg_id": command.get("msg_id"), "tx_id": command.get("tx_id"), "ok": False, "error": str(e)}
+                break
+
+        if reply is None:
+            reply = {"msg_id": command.get("msg_id"), "tx_id": command.get("tx_id"), "ok": False, "error": "no reply"}
+
+        try:
+            await self._producer.send_and_wait(self._replies_topic, reply)
+        except Exception as send_err:
+            print(f"Failed to send reply: {send_err}")

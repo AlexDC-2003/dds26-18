@@ -1,5 +1,6 @@
 from flask import Flask, abort, jsonify
 from msgspec import Struct, msgpack
+import logging
 import redis
 import os
 import uuid
@@ -7,6 +8,8 @@ import uuid
 from kafka_infra import StockKafkaInfrastructure
 from saga_dispatcher import stock_dispatcher, set_redis_client
 import lock_manager
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 
 DB_ERROR_STR = "DB error"
 

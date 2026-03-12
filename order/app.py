@@ -176,21 +176,26 @@ async def _get_or_create_tx_id(order_id: str) -> str:
     if existing:
         return existing.decode()
 
-    new_tx_id = str(uuid.uuid4())
+    # Use a deterministic tx_id based on order_id as fallback when the pointer
+    # key is missing (e.g. lost in AOF fsync window after order-db crash).
+    # This ensures Phase 3 retries always map to the same tx_id and can
+    # therefore find any existing TX record or stock idempotency keys instead
+    # of silently creating a new identity and orphaning an old stock reserve.
+    stable_tx_id = f"tx:{order_id}"
     try:
-        ok = await rset(_order_tx_key(order_id), new_tx_id, nx=True)
+        ok = await rset(_order_tx_key(order_id), stable_tx_id, nx=True)
     except redis.exceptions.RedisError:
         abort(400, DB_ERROR_STR)
 
     if ok:
-        return new_tx_id
+        return stable_tx_id
 
     try:
         existing2 = await rget(_order_tx_key(order_id))
     except redis.exceptions.RedisError:
         abort(400, DB_ERROR_STR)
 
-    return existing2.decode() if existing2 else new_tx_id
+    return existing2.decode() if existing2 else stable_tx_id
 
 
 async def _get_tx(tx_id: str) -> OrderTxValue | None:
@@ -415,8 +420,12 @@ async def rollback_stock(tx: OrderTxValue) -> None:
             if reply.status_code == 200:
                 tx.reserved_items = [(i, q) for i, q in tx.reserved_items if i != item_id]
                 await _save_tx(tx)
+                logging.info("[ROLLBACK:RELEASED] tx=%s item=%s qty=%s", tx.tx_id, item_id, quantity)
+            else:
+                logging.warning("[ROLLBACK:RELEASE-FAILED] tx=%s item=%s qty=%s status=%s err=%s",
+                                tx.tx_id, item_id, quantity, reply.status_code, reply._raw.get("error"))
         except Exception as e:
-            logging.warning(f"[SAGA] rollback_stock failed for item {item_id} (tx={tx.tx_id}): {e}")
+            logging.warning("[ROLLBACK:EXCEPTION] tx=%s item=%s qty=%s error=%s", tx.tx_id, item_id, quantity, e)
         # sunt de acord
 
 def _reserved_as_dict(reserved_items: list[tuple[str, int]]) -> dict[str, int]:
@@ -478,9 +487,12 @@ async def checkout(order_id: str):
                 # items (checks for a committed reserve key before adding stock back).
                 for item_id_old, qty_old in tx.items:
                     try:
-                        await release_stock(tx.tx_id, item_id_old, qty_old)
-                    except Exception:
-                        pass
+                        r = await release_stock(tx.tx_id, item_id_old, qty_old)
+                        logging.info("[ABORTED:EXTRA-RELEASE] order=%s old_tx=%s item=%s qty=%s status=%s",
+                                     order_id, tx.tx_id, item_id_old, qty_old, r.status_code)
+                    except Exception as e:
+                        logging.warning("[ABORTED:EXTRA-RELEASE-FAIL] order=%s old_tx=%s item=%s error=%s",
+                                        order_id, tx.tx_id, item_id_old, e)
 
                 # Refund in case the charge committed before the abort
                 # (e.g. Kafka reply timeout or Redis connection error after EXEC).
@@ -494,25 +506,19 @@ async def checkout(order_id: str):
                     await _save_tx(tx)
                     logging.info("[TX:ABORTED-REFUNDED] order=%s old_tx=%s", order_id, tx.tx_id)
 
-                tx_id = str(uuid.uuid4())                        # new tx_id
-                logging.info("[TX:NEW-ID] order=%s new_tx=%s", order_id, tx_id)
-                await rset(_order_tx_key(order_id), tx_id)       # overwrite order_tx:{order_id}
-                now = time.time()
-                tx = OrderTxValue(
-                    tx_id=tx_id,
-                    order_id=order_id,
-                    user_id=order_entry.user_id,
-                    total_cost=order_entry.total_cost,
-                    items=list(order_entry.items),
-                    state=TX_STARTED,
-                    reserved_items=[],
-                    payment_done=False,
-                    payment_refunded=False,
-                    stock_released=False,
-                    created_at=now,
-                    updated_at=now,
-                    error=None,
-                )
+                # Reset the existing TX record back to TX_STARTED so the same
+                # tx_id is reused for the retry.  Keeping a stable tx_id means:
+                # • Stock idempotency key (tied to tx_id+item) prevents a
+                #   double-reserve even if the order-tx pointer was lost.
+                # • Payment service can detect the prior refund and re-charge
+                #   correctly (see _charge_user refund-bypass logic).
+                logging.info("[TX:RESET] order=%s tx=%s reusing tx_id for retry", order_id, tx.tx_id)
+                tx.state = TX_STARTED
+                tx.reserved_items = []
+                tx.payment_done = False
+                tx.payment_refunded = False
+                tx.stock_released = False
+                tx.error = None
                 await _save_tx(tx)
 
             items_quantities: dict[str, int] = defaultdict(int)
