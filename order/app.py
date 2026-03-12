@@ -512,7 +512,8 @@ async def checkout(order_id: str):
                 #   double-reserve even if the order-tx pointer was lost.
                 # • Payment service can detect the prior refund and re-charge
                 #   correctly (see _charge_user refund-bypass logic).
-                logging.info("[TX:RESET] order=%s tx=%s reusing tx_id for retry", order_id, tx.tx_id)
+                new_tx_id = f"tx:{uuid.uuid4()}"
+                tx.tx_id = new_tx_id
                 tx.state = TX_STARTED
                 tx.reserved_items = []
                 tx.payment_done = False
@@ -520,6 +521,7 @@ async def checkout(order_id: str):
                 tx.stock_released = False
                 tx.error = None
                 await _save_tx(tx)
+                logging.info("[TX:RESET] order=%s tx=%s new tx_id generated for retry", order_id, tx.tx_id)
 
             items_quantities: dict[str, int] = defaultdict(int)
             for item_id, quantity in tx.items:
