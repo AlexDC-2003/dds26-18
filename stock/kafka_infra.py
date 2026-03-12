@@ -137,7 +137,7 @@ class StockKafkaInfrastructure:
                 if attempt < MAX_RETRIES:
                     print(f"[2PL] Wait-Die retry {attempt}/{MAX_RETRIES} for msg_id={command.get('msg_id')}")
                     await asyncio.sleep(backoff)
-                    backoff = min(backoff * 2, 5.0)
+                    backoff = min(backoff * 2, 1.0)
                 else:
                     print(f"[2PL] All {MAX_RETRIES} retries exhausted for msg_id={command.get('msg_id')}")
                     reply = {"msg_id": command.get("msg_id"), "tx_id": command.get("tx_id"), "ok": False, "error": str(e)}
