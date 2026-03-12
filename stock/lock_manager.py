@@ -94,7 +94,7 @@ def acquire_lock(item_id: str, tx_id: str, *, tx_ts: Optional[float] = None) -> 
         # younger requester dies, older requester waits.
         if holder_ts is not None and requester_ts > holder_ts:
             # r
-            return False, f"wait-die abort: tx {tx_id} (ts={requester_ts:.6f}) is younger than holder tx {holder_tx_id} (ts={holder_ts:.6f}) for item {item_id}"
+            return False, f"Stock wait-die abort: tx {tx_id} (ts={requester_ts:.6f}) is younger than holder tx {holder_tx_id} (ts={holder_ts:.6f}) for item {item_id}"
 
         if time.monotonic() >= deadline:
             raise LockTimeout(

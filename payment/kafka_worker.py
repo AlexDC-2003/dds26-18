@@ -15,6 +15,8 @@ from lock_manager import LockManager, Transaction, WaitDieAbort, LockTimeout
 class UserValue(Struct):
     credit: int
 
+class _LockRetry(Exception):
+    pass
 
 class Payment2PCTxValue(Struct):
     user_id: str
@@ -164,29 +166,50 @@ class PaymentKafkaWorker:
             self._producer = None
 
     async def _consume(self) -> None:
-        assert self._consumer is not None
-        assert self._producer is not None
-
         async for msg in self._consumer:
             if self._stop_evt.is_set():
                 break
-
             try:
                 cmd = json.loads(msg.value.decode("utf-8"))
             except Exception:
                 await self._consumer.commit()
                 continue
+            asyncio.create_task(self._process_one(cmd))
+            await self._consumer.commit()
+            
+    async def _process_one(self, cmd: Dict[str, Any]) -> None:
+        loop = asyncio.get_running_loop()
+        backoff = 0.1
+        reply = None
+        MAX_RETRIES = 5
 
-            reply = self._handle_command(cmd)
-
+        for attempt in range(1, MAX_RETRIES + 1):
             try:
-                payload = json.dumps(reply).encode("utf-8")
-                await self._producer.send_and_wait(self._replies_topic, payload)
-                await self._consumer.commit()
-            except Exception:
-                # If we fail to publish the reply, client may timeout and retry.
-                # Our operations are idempotent on success.
-                continue
+                reply = await loop.run_in_executor(None, self._handle_command, cmd)
+                # Only break if it wasn't a lock failure
+                err = reply.get("error") or ""
+                if err.startswith("Payment wait-die abort") or err.startswith("Payment lock timeout"):
+                    raise _LockRetry(reply["error"])
+                break
+            except (WaitDieAbort, LockTimeout, _LockRetry) as e:
+                if attempt < MAX_RETRIES:
+                    print(f"[2PL] Wait-Die retry {attempt}/{MAX_RETRIES} for msg_id={cmd.get('msg_id')}")
+                    await asyncio.sleep(backoff)
+                    backoff = min(backoff * 2, 5.0)
+                else:
+                    print(f"[2PL] All {MAX_RETRIES} retries exhausted for msg_id={cmd.get('msg_id')}")
+                    # reply already set to the last failure reply
+                    break
+
+        if reply is None:
+            reply = {"msg_id": cmd.get("msg_id"), "tx_id": cmd.get("tx_id"),
+                    "status_code": 400, "payload": {}, "error": "no reply", "ts": time.time()}
+
+        try:
+            payload = json.dumps(reply).encode("utf-8")
+            await self._producer.send_and_wait(self._replies_topic, payload)
+        except Exception as send_err:
+            print(f"Failed to send reply: {send_err}")
 
     def _handle_command(self, cmd: Dict[str, Any]) -> Dict[str, Any]:
         msg_id = cmd.get("msg_id")
@@ -270,11 +293,11 @@ class PaymentKafkaWorker:
             self._lock_manager.acquire(txn, f"user:{user_id}")
             return True, None
         except WaitDieAbort as e:
-            return False, f"wait-die abort: {e}"
+            return False, f"Payment wait-die abort: {e}"
         except LockTimeout as e:
-            return False, f"lock timeout: {e}"
+            return False, f"Payment lock timeout: {e}"
         except redis.exceptions.RedisError as e:
-            return False, f"DB error: {e}"
+            return False, f"Payment DB error: {e}"
 
     def _release_tx_locks(self, tx_id: str) -> None:
         txn = self._tx_contexts.pop(tx_id, None)

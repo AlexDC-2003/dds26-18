@@ -522,7 +522,7 @@ async def checkout(order_id: str):
                     if stock_reply.status_code != 200:
                         tx.state = TX_ABORTED
                         error_body = stock_reply.json() 
-                        tx.error = error_body.get("error") or f"Default error message on item {item_id}" #f"Out of stock on item_id: {item_id}"
+                        tx.error = error_body.get("error") or f"Error on item {item_id} and transaction {tx.tx_id}" #f"Out of stock on item_id: {item_id}"
                         await _save_tx(tx)
                         await _abort_participants(tx)
                         abort(400, tx.error)
@@ -535,7 +535,7 @@ async def checkout(order_id: str):
                     user_reply = await prepare_payment(tx.tx_id, tx.user_id, tx.total_cost, tx_ts=tx.created_at)
                     if user_reply.status_code != 200:
                         tx.state = TX_ABORTED
-                        tx.error = "User out of credit"
+                        tx.error = f"User out of credit: txid: {tx.tx_id}, tx_stockprepared: {tx.stock_prepared}"
                         await _save_tx(tx)
                         await _abort_participants(tx)
                         abort(400, tx.error)
