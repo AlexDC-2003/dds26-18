@@ -518,7 +518,14 @@ async def checkout(order_id: str):
                     already = prepared_now.get(item_id, 0)
                     if already >= quantity:
                         continue
-                    stock_reply = await prepare_stock(tx.tx_id, item_id, quantity, tx_ts=tx.created_at)
+                    try:
+                        stock_reply = await prepare_stock(tx.tx_id, item_id, quantity, tx_ts=tx.created_at)
+                    except asyncio.TimeoutError:
+                        tx.state = TX_ABORTED
+                        tx.error = f"Timeout waiting for stock prepare on item {item_id}"
+                        await _save_tx(tx)
+                        await _abort_participants(tx)
+                        abort(503, tx.error)
                     if stock_reply.status_code != 200:
                         tx.state = TX_ABORTED
                         error_body = stock_reply.json() 
@@ -532,7 +539,14 @@ async def checkout(order_id: str):
                     print(f"Prepared stock for item_id: {item_id}, quantity: {quantity} in tx_id: {tx.tx_id}")
 
                 if not tx.payment_prepared:
-                    user_reply = await prepare_payment(tx.tx_id, tx.user_id, tx.total_cost, tx_ts=tx.created_at)
+                    try:
+                        user_reply = await prepare_payment(tx.tx_id, tx.user_id, tx.total_cost, tx_ts=tx.created_at)
+                    except asyncio.TimeoutError:
+                        tx.state = TX_ABORTED
+                        tx.error = "Timeout waiting for payment prepare"
+                        await _save_tx(tx)
+                        await _abort_participants(tx)
+                        abort(503, tx.error)
                     if user_reply.status_code != 200:
                         tx.state = TX_ABORTED
                         tx.error = f"User out of credit: txid: {tx.tx_id}, tx_stockprepared: {tx.stock_prepared}"
