@@ -521,6 +521,7 @@ async def checkout(order_id: str):
                 tx.stock_released = False
                 tx.error = None
                 await _save_tx(tx)
+                await rset(_order_tx_key(order_id), new_tx_id)
                 logging.info("[TX:RESET] order=%s tx=%s new tx_id generated for retry", order_id, tx.tx_id)
 
             items_quantities: dict[str, int] = defaultdict(int)
