@@ -629,17 +629,14 @@ async def checkout(order_id: str):
                     print(f"Transaction completed for order_id: {order_id}, tx_id: {tx.tx_id}")
                 return Response("Checkout successful", status=200)
 
-        except _LockContention as e:
+
+        except (_LockContention, WaitDieAbort) as e:
             if attempt < MAX_RETRIES:
                 print(f"[Checkout] Lock contention on attempt {attempt + 1}/{MAX_RETRIES + 1}, retrying: {e}")
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 2.0)
             else:
                 abort(409, f"Checkout aborted after {MAX_RETRIES} retries: {e}")
-        except WaitDieAbort as e:
-            abort(409, f"Transaction aborted (wait-die): {e}")
-        except LockTimeout as e:
-            abort(503, f"Could not acquire lock in time: {e}")
 
 if __name__ == '__main__':
     app.run(host="0.0.0.0", port=8000, debug=True)
