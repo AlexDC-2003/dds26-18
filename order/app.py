@@ -57,6 +57,7 @@ async def http_post(url: str):
 async def startup():
     if INTERNAL_TRANSPORT == "kafka":
         await kafka_bus.start()
+    await _recover_in_flight_transactions()
 
 @app.after_serving
 async def shutdown():
@@ -244,6 +245,167 @@ async def _get_or_create_tx_record(tx_id: str, order_id: str, order_entry: Order
     if ok:
         return tx
     return (await _get_tx(tx_id)) or tx
+
+async def _recover_one_tx(tx: OrderTxValue, order_id: str) -> bool:
+    """Complete or roll back a single in-flight transaction. Returns True when done."""
+    # --- TX_STARTED: complete stock reservation then fall through ---
+    if tx.state == TX_STARTED:
+        items_quantities: dict[str, int] = defaultdict(int)
+        for item_id, quantity in tx.items:
+            items_quantities[item_id] += quantity
+
+        reserved_now = _reserved_as_dict(tx.reserved_items)
+        for item_id, quantity in items_quantities.items():
+            already = reserved_now.get(item_id, 0)
+            if already >= quantity:
+                continue
+            to_reserve = quantity - already
+            try:
+                stock_reply = await reserve_stock(tx.tx_id, item_id, to_reserve)
+            except Exception as e:
+                logging.warning("[RECOVERY:RESERVE] tx=%s item=%s error=%s", tx.tx_id, item_id, e)
+                return False
+            if stock_reply.status_code == 200:
+                _add_reserved(tx, item_id, to_reserve)
+                await _save_tx(tx)
+            else:
+                await rollback_stock(tx)
+                if tx.reserved_items:
+                    return False
+                tx.stock_released = True
+                tx.state = TX_ABORTED
+                tx.error = f"Recovery: out of stock on {item_id}"
+                await _save_tx(tx)
+                return True
+
+        tx.state = TX_STOCK_RESERVED
+        await _save_tx(tx)
+
+    # --- TX_ABORTED: finish any incomplete rollback / refund ---
+    if tx.state == TX_ABORTED:
+        if tx.reserved_items:
+            await rollback_stock(tx)
+            if tx.reserved_items:
+                return False  # stock still down
+            tx.stock_released = True
+            await _save_tx(tx)
+        # Extra-release for phantom reservations (crash between stock-db write and
+        # saving reserved_items).  Stock guards prevent double-release.
+        for item_id, qty in tx.items:
+            try:
+                await release_stock(tx.tx_id, item_id, qty)
+            except Exception as e:
+                logging.warning("[RECOVERY:EXTRA-RELEASE] tx=%s item=%s error=%s", tx.tx_id, item_id, e)
+        if tx.payment_done and not tx.payment_refunded:
+            try:
+                refund_reply = await refund_user(tx.tx_id, tx.user_id, tx.total_cost, tx_ts=tx.created_at)
+                if refund_reply.status_code in (200, 400):
+                    tx.payment_refunded = True
+                    await _save_tx(tx)
+                else:
+                    return False
+            except Exception as e:
+                logging.warning("[RECOVERY:REFUND] tx=%s error=%s", tx.tx_id, e)
+                return False
+        return True
+
+    # --- TX_STOCK_RESERVED: forward-recover by charging payment ---
+    if tx.state == TX_STOCK_RESERVED and not tx.payment_done:
+        logging.info("[RECOVERY:CHARGE] tx=%s order=%s", tx.tx_id, order_id)
+        try:
+            user_reply = await charge_user(tx.tx_id, tx.user_id, tx.total_cost, tx_ts=tx.created_at)
+        except Exception as e:
+            logging.warning("[RECOVERY:CHARGE-FAIL] tx=%s error=%s", tx.tx_id, e)
+            return False
+        if user_reply.status_code == 200:
+            tx.payment_done = True
+            tx.state = TX_PAYMENT_DONE
+            await _save_tx(tx)
+        else:
+            await rollback_stock(tx)
+            if tx.reserved_items:
+                return False
+            tx.stock_released = True
+            tx.state = TX_ABORTED
+            tx.error = "Recovery: payment failed"
+            await _save_tx(tx)
+            return True
+
+    # --- TX_PAYMENT_DONE: mark order as paid and complete ---
+    if tx.state == TX_PAYMENT_DONE:
+        logging.info("[RECOVERY:COMPLETE] tx=%s order=%s", tx.tx_id, order_id)
+        try:
+            raw_order = await rget(order_id)
+            if raw_order:
+                order_entry = msgpack.decode(raw_order, type=OrderValue)
+                if not order_entry.paid:
+                    order_entry.paid = True
+                    await rset(order_id, msgpack.encode(order_entry))
+            tx.state = TX_COMPLETED
+            await _save_tx(tx)
+            logging.info("[RECOVERY:COMPLETED] tx=%s order=%s", tx.tx_id, order_id)
+        except Exception as e:
+            logging.warning("[RECOVERY:COMPLETE-FAIL] tx=%s error=%s", tx.tx_id, e)
+            return False
+
+    return True
+
+
+async def _recover_in_flight_transactions():
+    """On startup: find and complete/rollback any transactions that were in-flight
+    when the order service previously crashed.
+    Uses a Redis NX lock so only one gunicorn worker runs recovery."""
+    lock_key = "order_service:recovery_lock"
+    try:
+        acquired = await rset(lock_key, "1", nx=True, ex=300)
+    except Exception as e:
+        logging.error("[RECOVERY] Could not acquire recovery lock: %s", e)
+        return
+    if not acquired:
+        logging.info("[RECOVERY] Another worker is handling recovery, skipping.")
+        return
+
+    logging.info("[RECOVERY] Scanning for in-flight transactions...")
+    try:
+        raw_keys = await asyncio.to_thread(db.keys, "order_tx:*")
+    except Exception as e:
+        logging.error("[RECOVERY] Failed to scan order_tx keys: %s", e)
+        await asyncio.to_thread(db.delete, lock_key)
+        return
+
+    recovered = failed = skipped = 0
+    for raw_key in raw_keys:
+        key_str = raw_key.decode() if isinstance(raw_key, bytes) else raw_key
+        order_id = key_str[len("order_tx:"):]
+        try:
+            raw_tx_id = await rget(key_str)
+            if not raw_tx_id:
+                skipped += 1
+                continue
+            tx_id = raw_tx_id.decode() if isinstance(raw_tx_id, bytes) else raw_tx_id
+            tx = await _get_tx(tx_id)
+            if tx is None or tx.state == TX_COMPLETED:
+                skipped += 1
+                continue
+            # Skip cleanly-aborted transactions (nothing left to do)
+            if (tx.state == TX_ABORTED
+                    and not tx.reserved_items
+                    and (not tx.payment_done or tx.payment_refunded)):
+                skipped += 1
+                continue
+            logging.info("[RECOVERY] tx=%s order=%s state=%s", tx_id, order_id, tx.state)
+            ok = await _recover_one_tx(tx, order_id)
+            if ok:
+                recovered += 1
+            else:
+                failed += 1
+        except Exception as e:
+            logging.warning("[RECOVERY] Error on order=%s: %s", order_id, e)
+            failed += 1
+
+    logging.info("[RECOVERY] Done: recovered=%d failed=%d skipped=%d", recovered, failed, skipped)
+    await asyncio.to_thread(db.delete, lock_key)
+
 
 @app.post('/create/<user_id>')
 async def create_order(user_id: str):
