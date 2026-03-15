@@ -1,7 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Bash(python test/fault_tolerance_test.py)"
-    ]
-  }
-}
