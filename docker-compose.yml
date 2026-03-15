@@ -25,7 +25,7 @@ services:
       - INTERNAL_TRANSPORT=kafka  
       - KAFKA_REQUEST_TIMEOUT_SEC=2
       - KAFKA_ORDER_GROUP_ID=order-service
-    command: hypercorn -b 0.0.0.0:5000 --workers 4 app:app
+    command: hypercorn -b 0.0.0.0:5000 --workers 8 app:app
     env_file:
       - env/order_redis.env
     depends_on:
@@ -47,6 +47,8 @@ services:
     build: ./stock
     image: stock:latest
     restart: always
+    deploy:
+      replicas: 5
     environment:
       - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
       - KAFKA_STOCK_COMMANDS_TOPIC=stock.commands
@@ -74,6 +76,8 @@ services:
     build: ./payment
     image: user:latest
     restart: always
+    deploy:
+      replicas: 5
     environment:
       - INTERNAL_TRANSPORT=kafka
       - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
@@ -159,7 +163,11 @@ services:
     entrypoint: |
       sh -c '
       while true; do
-        for service in dds26-18-stock-service-1 dds26-18-order-service-1 dds26-18-payment-service-1 dds26-18-stock-db-1 dds26-18-order-db-1 dds26-18-payment-db-1; do
+        for service in \
+          dds26-18-stock-service-1 dds26-18-stock-service-2 dds26-18-stock-service-3 dds26-18-stock-service-4 dds26-18-stock-service-5 \
+          dds26-18-payment-service-1 dds26-18-payment-service-2 dds26-18-payment-service-3 dds26-18-payment-service-4 dds26-18-payment-service-5 \
+          dds26-18-order-service-1 \
+          dds26-18-stock-db-1 dds26-18-order-db-1 dds26-18-payment-db-1; do
           STATUS=$$(docker inspect $$service --format="{{.State.Status}}" 2>/dev/null)
           if [ "$$STATUS" = "exited" ] || [ "$$STATUS" = "dead" ]; then
             echo "$$service is down, restarting..."

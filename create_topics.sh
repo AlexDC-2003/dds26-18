@@ -15,6 +15,6 @@ for topic in "${topics[@]}"; do
     --if-not-exists  \
     --topic "$topic" \
     --bootstrap-server kafka:9092 \
-    --partitions 3 \
+    --partitions 5 \
     --replication-factor 1
 done
