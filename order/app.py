@@ -479,7 +479,7 @@ async def _abort_participants(tx: OrderTxValue) -> None:
 
 @app.post('/checkout/<order_id>')
 async def checkout(order_id: str):
-    MAX_RETRIES = 10
+    MAX_RETRIES = 5
     backoff = 0.2
     for attempt in range(MAX_RETRIES + 1):
         order_entry: OrderValue = await get_order_from_db(order_id)
