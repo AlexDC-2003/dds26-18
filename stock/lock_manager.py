@@ -87,8 +87,8 @@ def acquire_lock(item_id: str, tx_id: str, *, tx_ts: Optional[float] = None) -> 
             continue
 
         if holder_tx_id == tx_id:
-            # Re-entrant acquire by same transaction.
-            return False, 'the same timestamp'
+            # Re-entrant acquire — we already own this lock.
+            return True, None
         # print(f'[2PL] Lock on item {item_id} is held by tx {holder_tx_id} (ts={holder_ts:.6f}), requester tx {tx_id} (ts={requester_ts:.6f})')
         # Wait-Die:
         # younger requester dies, older requester waits.

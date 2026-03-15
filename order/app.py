@@ -145,7 +145,7 @@ def _as_response_like(reply: dict, *, service: str):
     return SimpleNamespace(
         status_code=sc,
         _raw=reply,
-        json=lambda: reply.get("payload", reply)
+        json=lambda: reply.get("payload") or reply
     )
 
 async def get_order_from_db(order_id: str) -> OrderValue:
