@@ -181,7 +181,7 @@ class PaymentKafkaWorker:
         loop = asyncio.get_running_loop()
         backoff = 0.1
         reply = None
-        MAX_RETRIES = 5
+        MAX_RETRIES = 10
 
         for attempt in range(1, MAX_RETRIES + 1):
             try:

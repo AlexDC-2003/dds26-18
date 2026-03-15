@@ -14,7 +14,7 @@ RETRY_BACKOFF_MIN_SECONDS: float = 0.1
 RETRY_BACKOFF_MAX_SECONDS: float = 0.5
 
 # Max retries in kafka_infra before giving up and sending an error reply.
-MAX_RETRIES: int = 5
+MAX_RETRIES: int = 10
 
 _SEP = "|"
 _redis_client: Optional[redis.Redis] = None
