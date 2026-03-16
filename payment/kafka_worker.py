@@ -145,7 +145,7 @@ class PaymentKafkaWorker:
             self._commands_topic,
             bootstrap_servers=self._bootstrap,
             group_id=self._group_id,
-            enable_auto_commit=False,
+            enable_auto_commit=True,
             auto_offset_reset="earliest",
         )
         await self._consumer.start()
@@ -175,8 +175,8 @@ class PaymentKafkaWorker:
                 await self._consumer.commit()
                 continue
             asyncio.create_task(self._process_one(cmd))
-            await self._consumer.commit()
-            
+            # await self._consumer.commit()
+
     async def _process_one(self, cmd: Dict[str, Any]) -> None:
         loop = asyncio.get_running_loop()
         backoff = 0.1
