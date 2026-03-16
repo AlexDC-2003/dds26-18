@@ -589,10 +589,6 @@ async def checkout(order_id: str):
 
                     deadline = time.time() + COMMIT_RETRY_TIMEOUT_SEC
                     while not (tx.payment_committed and tx.stock_committed):
-                        if time.time() > deadline:
-                            tx.error = "Commit timed out waiting for participants"
-                            await _save_tx(tx)
-                            abort(503, tx.error)
 
                         if not tx.payment_committed:
                             payment_commit_reply = await commit_payment(tx.tx_id, tx_ts=tx.created_at)
