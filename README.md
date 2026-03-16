@@ -1,9 +1,24 @@
-# Distributed Data Systems Project Template
+# Distributed Data Systems Project 
 
-Basic project structure with Python's Flask and Redis. 
-**You are free to use any web framework in any language and any database you like for this project.**
+We implement a distributed webshop using microservices for order, payment, and stock. Each service has its own Redis database and the services communicate internally through Kafka. 
 
-### Project structure
+We have two versions of the checkout protocol:
+
+- a 2PC-based version (branch: [2pc_dev]), where the order service coordinates a distributed prepare/commit/abort protocol.
+
+- a Saga-based version (branch: [saga_dev] and [saga_replicas]), where the order service orchestrates local actions and compensating actions.
+
+Both versions use the same external API structure, but differ in how they coordinate distributed state changes during checkout.
+
+![System architecture](dds.png)
+
+## 2PC 
+Checkout is coordinated by the order service. It first asks the stock and payment services to prepare their part of the transaction, and only if all participants are ready, it sends the final commit decision. If any step fails, the transaction is aborted. This approach is designed to provide all-or-nothing distributed commit across services.
+
+## Saga
+The order service orchestrates checkout as a sequence of local transactions. Instead of waiting for a global commit decision, services perform their actions directly, and failures are handled through compensating actions such as releasing stock or refunding payment.
+
+## Project structure
 
 * `env`
     Folder containing the Redis env variables for the docker-compose deployment
@@ -15,39 +30,85 @@ Basic project structure with Python's Flask and Redis.
     Folder containing the kubernetes deployments, apps and services for the ingress, order, payment and stock services.
     
 * `order`
-    Folder containing the order application logic and dockerfile. 
+    Folder containing order application logic, transaction orchestration logic, lock management, Kafka request/reply handling, and Dockerfile. 
     
 * `payment`
-    Folder containing the payment application logic and dockerfile. 
+    Folder containing the payment application logic, Kafka worker for payment commands, lock management, and Dockerfile.
 
 * `stock`
-    Folder containing the stock application logic and dockerfile. 
+    Folder containing the stock application logic, Kafka consumer/dispatcher for stock commands, lock management, and Dockerfile.
 
 * `test`
-    Folder containing some basic correctness tests for the entire system. (Feel free to enhance them)
+    Folder containing some basic correctness tests for the entire system. 
 
-### Deployment types:
+## Deployment :
 
 #### docker-compose (local development)
 
-After coding the REST endpoint logic run `docker-compose up --build` in the base folder to test if your logic is correct
-(you can use the provided tests in the `\test` folder and change them as you wish). 
+For local development and testing run `docker-compose up --build` in the base folder.
+This starts the gateway, all three services, their Redis instances, Kafka, ZooKeeper, topic setup, and the watchdog container.
 
 ***Requirements:*** You need to have docker and docker-compose installed on your machine. 
 
-K8s is also possible, but we do not require it as part of your submission. 
+## Fault Tolerance
 
-#### minikube (local k8s cluster)
+We include a watchdog container that monitors the service and database containers and restarts them if they crash. This is useful during fault-tolerance experiments and test scenarios where containers are intentionally killed during checkout.
 
-This setup is for local k8s testing to see if your k8s config works before deploying to the cloud. 
-First deploy your database using helm by running the `deploy-charts-minicube.sh` file (in this example the DB is Redis 
-but you can find any database you want in https://artifacthub.io/ and adapt the script). Then adapt the k8s configuration files in the
-`\k8s` folder to mach your system and then run `kubectl apply -f .` in the k8s folder. 
+## Contributions
 
-***Requirements:*** You need to have minikube (with ingress enabled) and helm installed on your machine.
+Please read the contributions.txt file for the division of work across team members.
 
-#### kubernetes cluster (managed k8s cluster in the cloud)
+# Distributed Data Systems Project 
 
-Similarly to the `minikube` deployment but run the `deploy-charts-cluster.sh` in the helm step to also install an ingress to the cluster. 
+We implement a distributed webshop using microservices for order, payment, and stock. Each service has its own Redis database and the services communicate internally through Kafka. 
 
-***Requirements:*** You need to have access to kubectl of a k8s cluster.
+We have two versions of the checkout protocol:
+
+- a 2PC-based version (branch: [2pc_dev]), where the order service coordinates a distributed prepare/commit/abort protocol.
+
+- a Saga-based version (branch: [saga_dev] and [saga_replicas]), where the order service orchestrates local actions and compensating actions.
+
+Both versions use the same external API structure, but differ in how they coordinate distributed state changes during checkout.
+
+## 2PC 
+Checkout is coordinated by the order service. It first asks the stock and payment services to prepare their part of the transaction, and only if all participants are ready, it sends the final commit decision. If any step fails, the transaction is aborted. This approach is designed to provide all-or-nothing distributed commit across services.
+
+## Saga
+The order service orchestrates checkout as a sequence of local transactions. Instead of waiting for a global commit decision, services perform their actions directly, and failures are handled through compensating actions such as releasing stock or refunding payment.
+
+## Project structure
+
+* `env`
+    Folder containing the Redis env variables for the docker-compose deployment
+    
+* `helm-config` 
+   Helm chart values for Redis and ingress-nginx
+        
+* `k8s`
+    Folder containing the kubernetes deployments, apps and services for the ingress, order, payment and stock services.
+    
+* `order`
+    Folder containing order application logic, transaction orchestration logic, lock management, Kafka request/reply handling, and Dockerfile. 
+    
+* `payment`
+    Folder containing the payment application logic, Kafka worker for payment commands, lock management, and Dockerfile.
+
+* `stock`
+    Folder containing the stock application logic, Kafka consumer/dispatcher for stock commands, lock management, and Dockerfile.
+
+* `test`
+    Folder containing some basic correctness tests for the entire system. 
+
+## Deployment :
+
+#### docker-compose (local development)
+
+For local development and testing run `docker-compose up --build` in the base folder.
+This starts the gateway, all three services, their Redis instances, Kafka, ZooKeeper, topic setup, and the watchdog container.
+
+***Requirements:*** You need to have docker and docker-compose installed on your machine. 
+
+## Fault Tolerance
+
+We include a watchdog container that monitors the service and database containers and restarts them if they crash. This is useful during fault-tolerance experiments and test scenarios where containers are intentionally killed during checkout.
+
