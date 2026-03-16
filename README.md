@@ -41,7 +41,7 @@ The order service orchestrates checkout as a sequence of local transactions. Ins
 * `test`
     Folder containing some basic correctness tests for the entire system. 
 
-## Deployment :
+## Deployment 
 
 #### docker-compose (local development)
 
