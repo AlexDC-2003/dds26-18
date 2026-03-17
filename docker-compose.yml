@@ -23,7 +23,7 @@ services:
       - KAFKA_REPLIES_TOPICS=stock.replies,payment.replies
       - KAFKA_PAYMENT_COMMANDS_TOPIC=payment.commands
       - INTERNAL_TRANSPORT=kafka  
-      - KAFKA_REQUEST_TIMEOUT_SEC=2
+      - KAFKA_REQUEST_TIMEOUT_SEC=15
       - KAFKA_ORDER_GROUP_ID=order-service
     command: hypercorn -b 0.0.0.0:5000 --workers 4 app:app
     env_file:

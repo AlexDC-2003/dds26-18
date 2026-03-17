@@ -699,7 +699,19 @@ async def checkout(order_id: str):
                         continue
 
                     to_reserve = quantity - already
-                    stock_reply = await reserve_stock(tx.tx_id, item_id, to_reserve)
+                    try:
+                        stock_reply = await reserve_stock(tx.tx_id, item_id, to_reserve)
+                    except Exception as e:
+                        logging.warning("[TX:RESERVE-TIMEOUT] order=%s tx=%s item=%s error=%s",
+                                        order_id, tx.tx_id, item_id, e)
+                        _add_reserved(tx, item_id, to_reserve)
+                        await rollback_stock(tx)
+                        if not tx.reserved_items:
+                            tx.stock_released = True
+                        tx.state = TX_ABORTED
+                        tx.error = f"Reserve timed out on item_id: {item_id}"
+                        await _save_tx(tx)
+                        abort(503, tx.error)
                     if stock_reply.status_code != 200:
                         if not tx.stock_released:
                             await rollback_stock(tx)

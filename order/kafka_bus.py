@@ -74,7 +74,8 @@ class KafkaBus:
 
         try:
             payload = json.dumps(message).encode("utf-8")
-            await self._producer.send_and_wait(topic, payload)
+            await self._producer.send_and_wait(topic, payload,
+                key=message.get("tx_id", "").encode("utf-8"))
             return await asyncio.wait_for(reply_future, timeout=timeout_sec)
         finally:
             self._pending.pop(msg_id, None)
