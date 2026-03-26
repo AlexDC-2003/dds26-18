@@ -53,8 +53,8 @@ def _update_credit_2pl(user_id: str, delta: int) -> int:
     """Apply *delta* to user credit under a 2PL exclusive lock.
 
     Each REST call is its own short-lived transaction with a fresh timestamp,
-    so it will always be "younger" than any long-running saga transaction and
-    will die (retry at the HTTP level) rather than blocking the saga.
+    so it will always be "younger" than any long-running 2pc transaction and
+    will die (retry at the HTTP level) rather than blocking the 2pc.
 
     Returns the new credit balance.
     Aborts (raises) on lock conflict, DB error, or insufficient funds.
