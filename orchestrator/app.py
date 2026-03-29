@@ -24,7 +24,7 @@ db: redis.Redis = redis.Redis(
     db=int(os.environ["REDIS_DB"]),
 )
 
-KAFKA_TIMEOUT_SEC = float(os.environ.get("KAFKA_REQUEST_TIMEOUT_SEC", "6"))
+KAFKA_TIMEOUT_SEC = float(os.environ.get("KAFKA_REQUEST_TIMEOUT_SEC", "15"))
 COMMIT_RETRY_SLEEP_SEC = float(os.environ.get("KAFKA_COMMIT_RETRY_SLEEP_SEC", "0.05"))
 
 ORCHESTRATOR_COMMANDS_TOPIC = os.environ.get("KAFKA_ORCHESTRATOR_COMMANDS_TOPIC", "orchestrator.commands")
