@@ -281,7 +281,10 @@ async def _abort_participants(tx: TxRecord) -> None:
             await abort_payment(tx.tx_id, tx_ts=tx.created_at)
         except Exception:
             pass
-    if tx.stock_prepared and not tx.stock_committed:
+    # Always try to abort stock — some items may have been prepared even if
+    # tx.stock_prepared was not yet set (e.g. parallel prepares).  The abort
+    # handler is idempotent and handles missing tx records as noop.
+    if not tx.stock_committed:
         try:
             await abort_stock(tx.tx_id, tx_ts=tx.created_at)
         except Exception:
@@ -318,49 +321,30 @@ async def _run_transaction(body: dict) -> dict:
         await _save_tx(tx)
 
         prepared_now = _prepared_as_dict(tx.prepared_items)
-        unprepared = {iid: qty for iid, qty in items_quantities.items()
-                      if prepared_now.get(iid, 0) < qty}
-
-        if unprepared:
-            # Fire all stock prepares in parallel
-            async def _prepare_one(item_id: str, quantity: int):
-                return item_id, quantity, await prepare_stock(
-                    tx.tx_id, item_id, quantity, tx_ts=tx.created_at)
-
-            results = await asyncio.gather(
-                *(_prepare_one(iid, qty) for iid, qty in unprepared.items()),
-                return_exceptions=True,
-            )
-
-            for r in results:
-                if isinstance(r, asyncio.TimeoutError):
-                    tx.state = TX_ABORTED
-                    tx.error = f"Timeout waiting for stock prepare"
-                    await _save_tx(tx)
-                    await _abort_participants(tx)
-                    return {"status": "timeout", "error": tx.error}
-                if isinstance(r, Exception):
-                    tx.state = TX_ABORTED
-                    tx.error = str(r)
-                    await _save_tx(tx)
-                    await _abort_participants(tx)
-                    return {"status": "aborted", "error": tx.error}
-
-                item_id, quantity, stock_reply = r
-                if stock_reply.status_code != 200:
-                    error_body = stock_reply.json()
-                    tx.error = (error_body.get("error") if isinstance(error_body, dict) else None) or f"Error on item {item_id}"
-                    tx.state = TX_ABORTED
-                    await _save_tx(tx)
-                    await _abort_participants(tx)
-                    if _is_lock_error(tx.error):
-                        return {"status": "lock_contention", "error": tx.error}
-                    return {"status": "aborted", "error": tx.error}
-                _set_prepared_qty(tx, item_id, quantity)
-                print(f"Prepared stock item={item_id} qty={quantity} tx={tx.tx_id}", flush=True)
-
+        for item_id, quantity in items_quantities.items():
+            if prepared_now.get(item_id, 0) >= quantity:
+                continue
+            try:
+                stock_reply = await prepare_stock(tx.tx_id, item_id, quantity, tx_ts=tx.created_at)
+            except asyncio.TimeoutError:
+                tx.state = TX_ABORTED
+                tx.error = f"Timeout waiting for stock prepare on item {item_id}"
+                await _save_tx(tx)
+                await _abort_participants(tx)
+                return {"status": "timeout", "error": tx.error}
+            if stock_reply.status_code != 200:
+                error_body = stock_reply.json()
+                tx.error = (error_body.get("error") if isinstance(error_body, dict) else None) or f"Error on item {item_id}"
+                tx.state = TX_ABORTED
+                await _save_tx(tx)
+                await _abort_participants(tx)
+                if _is_lock_error(tx.error):
+                    return {"status": "lock_contention", "error": tx.error}
+                return {"status": "aborted", "error": tx.error}
+            _set_prepared_qty(tx, item_id, quantity)
             tx.stock_prepared = True
             await _save_tx(tx)
+            print(f"Prepared stock item={item_id} qty={quantity} tx={tx.tx_id}", flush=True)
 
         if not tx.payment_prepared:
             try:
