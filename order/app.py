@@ -289,7 +289,13 @@ async def checkout(order_id: str):
                     await rset(_order_tx_key(order_id), new_tx_id)
                     abort(400, result.get("error", "Checkout failed"))
 
-                else:  # timeout or unexpected
+                elif status == "timeout":
+                    # Retriable — fresh tx_id and retry like lock contention
+                    new_tx_id = str(uuid.uuid4())
+                    await rset(_order_tx_key(order_id), new_tx_id)
+                    raise _LockContention(result.get("error", "stock prepare timeout"))
+
+                else:  # unexpected
                     abort(503, result.get("error", "Orchestrator error"))
 
         except (_LockContention, WaitDieAbort) as e:

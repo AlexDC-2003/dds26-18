@@ -6,7 +6,7 @@ import redis
 
 # Match payment service lock lifecycle and wait budget.
 LOCK_TTL_SECONDS: float = 30.0
-WAIT_TIMEOUT_SECONDS: float = 10.0
+WAIT_TIMEOUT_SECONDS: float = 3.0
 WAIT_POLL_INTERVAL_SECONDS: float = 0.05
 
 # Random back-off range after a wait-die abort (desynchronises competing txs).
