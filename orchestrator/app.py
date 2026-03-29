@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import os
 import time
@@ -6,8 +7,9 @@ from collections import defaultdict
 from types import SimpleNamespace
 
 import redis
+from aiokafka import AIOKafkaConsumer
 from msgspec import Struct, msgpack
-from quart import Quart, abort, jsonify, request
+from quart import Quart, abort
 
 from kafka_bus import KafkaBus
 
@@ -25,16 +27,32 @@ db: redis.Redis = redis.Redis(
 KAFKA_TIMEOUT_SEC = float(os.environ.get("KAFKA_REQUEST_TIMEOUT_SEC", "6"))
 COMMIT_RETRY_SLEEP_SEC = float(os.environ.get("KAFKA_COMMIT_RETRY_SLEEP_SEC", "0.05"))
 
+ORCHESTRATOR_COMMANDS_TOPIC = os.environ.get("KAFKA_ORCHESTRATOR_COMMANDS_TOPIC", "orchestrator.commands")
+ORCHESTRATOR_REPLIES_TOPIC = os.environ.get("KAFKA_ORCHESTRATOR_REPLIES_TOPIC", "orchestrator.replies")
+
 kafka_bus = KafkaBus()
+_commands_consumer: AIOKafkaConsumer | None = None
 
 
 @app.before_serving
 async def startup():
+    global _commands_consumer
     await kafka_bus.start()
+    bootstrap = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "")
+    _commands_consumer = AIOKafkaConsumer(
+        ORCHESTRATOR_COMMANDS_TOPIC,
+        bootstrap_servers=bootstrap,
+        enable_auto_commit=True,
+        auto_offset_reset="latest",
+    )
+    await _commands_consumer.start()
+    asyncio.create_task(_consume_commands())
 
 
 @app.after_serving
 async def shutdown():
+    if _commands_consumer:
+        await _commands_consumer.stop()
     await kafka_bus.stop()
     await asyncio.to_thread(db.close)
 
@@ -270,11 +288,9 @@ async def _abort_participants(tx: TxRecord) -> None:
             pass
 
 
-# --- Main endpoint ---
+# --- Core transaction logic ---
 
-@app.post("/execute")
-async def execute_transaction():
-    body = await request.get_json()
+async def _run_transaction(body: dict) -> dict:
     tx_id: str = body["tx_id"]
     order_id: str = body["order_id"]
     user_id: str = body["user_id"]
@@ -285,12 +301,12 @@ async def execute_transaction():
     tx = await _get_or_create_tx_record(tx_id, order_id, user_id, total_cost, items, tx_ts)
 
     if tx.state == TX_COMPLETED:
-        return jsonify({"status": "committed"})
+        return {"status": "committed"}
 
     if tx.state == TX_ABORTED:
         if _is_lock_error(tx.error):
-            return jsonify({"status": "lock_contention", "error": tx.error}), 409
-        return jsonify({"status": "aborted", "error": tx.error or "previously aborted"}), 400
+            return {"status": "lock_contention", "error": tx.error}
+        return {"status": "aborted", "error": tx.error or "previously aborted"}
 
     items_quantities: dict[str, int] = defaultdict(int)
     for item_id, quantity in tx.items:
@@ -312,7 +328,7 @@ async def execute_transaction():
                 tx.error = f"Timeout waiting for stock prepare on item {item_id}"
                 await _save_tx(tx)
                 await _abort_participants(tx)
-                return jsonify({"status": "timeout", "error": tx.error}), 503
+                return {"status": "timeout", "error": tx.error}
             if stock_reply.status_code != 200:
                 error_body = stock_reply.json()
                 tx.error = (error_body.get("error") if isinstance(error_body, dict) else None) or f"Error on item {item_id}"
@@ -320,8 +336,8 @@ async def execute_transaction():
                 await _save_tx(tx)
                 await _abort_participants(tx)
                 if _is_lock_error(tx.error):
-                    return jsonify({"status": "lock_contention", "error": tx.error}), 409
-                return jsonify({"status": "aborted", "error": tx.error}), 400
+                    return {"status": "lock_contention", "error": tx.error}
+                return {"status": "aborted", "error": tx.error}
             _set_prepared_qty(tx, item_id, quantity)
             tx.stock_prepared = True
             await _save_tx(tx)
@@ -335,7 +351,7 @@ async def execute_transaction():
                 tx.error = "Timeout waiting for payment prepare"
                 await _save_tx(tx)
                 await _abort_participants(tx)
-                return jsonify({"status": "timeout", "error": tx.error}), 503
+                return {"status": "timeout", "error": tx.error}
             if user_reply.status_code != 200:
                 payment_body = user_reply.json()
                 payment_err = payment_body.get("error") if isinstance(payment_body, dict) else None
@@ -344,12 +360,12 @@ async def execute_transaction():
                     tx.error = payment_err
                     await _save_tx(tx)
                     await _abort_participants(tx)
-                    return jsonify({"status": "lock_contention", "error": tx.error}), 409
+                    return {"status": "lock_contention", "error": tx.error}
                 tx.state = TX_ABORTED
                 tx.error = f"User out of credit: txid={tx.tx_id}"
                 await _save_tx(tx)
                 await _abort_participants(tx)
-                return jsonify({"status": "aborted", "error": tx.error}), 400
+                return {"status": "aborted", "error": tx.error}
             tx.payment_prepared = True
             await _save_tx(tx)
             print(f"Prepared payment user={tx.user_id} amount={tx.total_cost} tx={tx.tx_id}", flush=True)
@@ -396,7 +412,29 @@ async def execute_transaction():
         await _save_tx(tx)
         print(f"Completed tx={tx.tx_id} order={order_id}", flush=True)
 
-    return jsonify({"status": "committed"})
+    return {"status": "committed"}
+
+
+# --- Kafka command consumer ---
+
+async def _consume_commands() -> None:
+    assert _commands_consumer is not None
+    async for msg in _commands_consumer:
+        try:
+            data = json.loads(msg.value.decode("utf-8"))
+        except Exception:
+            continue
+        asyncio.create_task(_handle_command(data))
+
+
+async def _handle_command(data: dict) -> None:
+    msg_id = data.get("msg_id")
+    try:
+        result = await _run_transaction(data)
+    except Exception as e:
+        result = {"status": "aborted", "error": f"Internal error: {e}"}
+    result["msg_id"] = msg_id
+    await kafka_bus.publish(ORCHESTRATOR_REPLIES_TOPIC, result)
 
 
 if __name__ == "__main__":

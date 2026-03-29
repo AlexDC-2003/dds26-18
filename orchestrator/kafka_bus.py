@@ -76,6 +76,12 @@ class KafkaBus:
         finally:
             self._pending.pop(msg_id, None)
 
+    async def publish(self, topic: str, message: dict) -> None:
+        if self._producer is None:
+            raise RuntimeError("Producer not started")
+        payload = json.dumps(message).encode("utf-8")
+        await self._producer.send_and_wait(topic, payload)
+
     async def _consume_replies(self) -> None:
         assert self._consumer is not None
         async for msg in self._consumer:

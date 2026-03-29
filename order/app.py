@@ -1,6 +1,5 @@
 import logging
 import os
-import atexit
 import random
 import uuid
 import time
@@ -12,6 +11,7 @@ from contextlib import asynccontextmanager
 from lock_manager import Transaction, LockManager, LockTimeout, WaitDieAbort
 from msgspec import msgpack, Struct
 from quart import Quart, jsonify, abort, Response
+from kafka_bus import KafkaBus
 
 
 app = Quart("order-service")
@@ -20,7 +20,7 @@ DB_ERROR_STR = "DB error"
 REQ_ERROR_STR = "Requests error"
 
 GATEWAY_URL = os.environ['GATEWAY_URL']
-ORCHESTRATOR_URL = os.environ['ORCHESTRATOR_URL']
+KAFKA_CHECKOUT_TIMEOUT_SEC = float(os.environ.get("KAFKA_REQUEST_TIMEOUT_SEC", "120"))
 
 db: redis.Redis = redis.Redis(
     host=os.environ['REDIS_HOST'],
@@ -30,6 +30,7 @@ db: redis.Redis = redis.Redis(
 )
 
 lock_manager = LockManager(db=db)
+kafka_bus = KafkaBus()
 
 ORDER_TX_KEY_PREFIX = "order_tx:"   # maps order_id -> tx_id
 
@@ -44,8 +45,14 @@ async def rmset(mapping: dict[str, bytes]):
     return await asyncio.to_thread(db.mset, mapping)
 
 
+@app.before_serving
+async def startup():
+    await kafka_bus.start()
+
+
 @app.after_serving
 async def shutdown():
+    await kafka_bus.stop()
     await asyncio.to_thread(db.close)
 
 
@@ -125,19 +132,21 @@ async def http_get(url: str):
 
 
 async def call_orchestrator(tx_id: str, order_id: str, order_entry: OrderValue, tx_ts: float) -> dict:
-    body = {
-        "tx_id": tx_id,
-        "order_id": order_id,
-        "user_id": order_entry.user_id,
-        "total_cost": order_entry.total_cost,
-        "items": list(order_entry.items),
-        "tx_ts": tx_ts,
-    }
     try:
-        resp = await asyncio.to_thread(
-            lambda: requests.post(f"{ORCHESTRATOR_URL}/execute", json=body, timeout=120)
+        return await kafka_bus.request(
+            os.environ["KAFKA_ORCHESTRATOR_COMMANDS_TOPIC"],
+            {
+                "msg_id": f"execute:{tx_id}",
+                "type": "execute",
+                "tx_id": tx_id,
+                "order_id": order_id,
+                "user_id": order_entry.user_id,
+                "total_cost": order_entry.total_cost,
+                "items": list(order_entry.items),
+                "tx_ts": tx_ts,
+            },
+            timeout_sec=KAFKA_CHECKOUT_TIMEOUT_SEC,
         )
-        return resp.json()
     except Exception as e:
         return {"status": "timeout", "error": str(e)}
 
@@ -276,6 +285,8 @@ async def checkout(order_id: str):
                     raise _LockContention(result.get("error", "lock contention"))
 
                 elif status == "aborted":
+                    new_tx_id = str(uuid.uuid4())
+                    await rset(_order_tx_key(order_id), new_tx_id)
                     abort(400, result.get("error", "Checkout failed"))
 
                 else:  # timeout or unexpected

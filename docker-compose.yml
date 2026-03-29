@@ -21,6 +21,8 @@ services:
       - KAFKA_STOCK_COMMANDS_TOPIC=stock.commands
       - KAFKA_PAYMENT_COMMANDS_TOPIC=payment.commands
       - KAFKA_REPLIES_TOPICS=stock.replies,payment.replies
+      - KAFKA_ORCHESTRATOR_COMMANDS_TOPIC=orchestrator.commands
+      - KAFKA_ORCHESTRATOR_REPLIES_TOPIC=orchestrator.replies
       - KAFKA_REQUEST_TIMEOUT_SEC=2
       - KAFKA_COMMIT_RETRY_SLEEP_SEC=0.05
     command: hypercorn -b 0.0.0.0:5000 --workers 1 app:app
@@ -47,15 +49,20 @@ services:
     restart: always
     environment:
       - GATEWAY_URL=http://gateway:80
-      - ORCHESTRATOR_URL=http://orchestrator:5000
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      - KAFKA_ORCHESTRATOR_COMMANDS_TOPIC=orchestrator.commands
+      - KAFKA_REPLIES_TOPICS=orchestrator.replies
+      - KAFKA_REQUEST_TIMEOUT_SEC=120
     command: hypercorn -b 0.0.0.0:5000 --workers 1 app:app
     env_file:
       - env/order_redis.env
     depends_on:
       order-db:
         condition: service_started
-      orchestrator:
-        condition: service_started
+      kafka:
+        condition: service_healthy
+      kafka-setup:
+        condition: service_completed_successfully
 
   order-db:
     image: redis:7.2-bookworm
