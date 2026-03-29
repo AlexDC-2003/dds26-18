@@ -9,7 +9,6 @@ and OrderTxValue records and honor the same distributed lock keys.
 """
 
 import asyncio
-import json
 import logging
 import os
 import time
@@ -19,8 +18,9 @@ from contextlib import asynccontextmanager
 from types import SimpleNamespace
 
 import redis
-from aiokafka import AIOKafkaConsumer
 from msgspec import Struct, msgpack
+from quart import Quart, abort, jsonify
+from quart import request
 
 from kafka_bus import KafkaBus
 from lock_manager import LockManager, LockTimeout, Transaction, WaitDieAbort
@@ -31,27 +31,23 @@ logging.basicConfig(level=logging.INFO)
 # Redis – shared with order-service (same host/port/password/db)
 # ---------------------------------------------------------------------------
 
-db: redis.Redis = redis.Redis(
-    host=os.environ["REDIS_HOST"],
-    port=int(os.environ["REDIS_PORT"]),
-    password=os.environ["REDIS_PASSWORD"],
-    db=int(os.environ["REDIS_DB"]),
-)
+app = Quart("order-service")
+
+DB_ERROR_STR = "DB error"
+REQ_ERROR_STR = "Requests error"
+
+# GATEWAY_URL = os.environ['GATEWAY_URL']
+
+
+db: redis.Redis = redis.Redis(host=os.environ['REDIS_HOST'],
+                              port=int(os.environ['REDIS_PORT']),
+                              password=os.environ['REDIS_PASSWORD'],
+                              db=int(os.environ['REDIS_DB']))
 
 lock_manager = LockManager(db=db)
+INTERNAL_TRANSPORT = os.environ.get("INTERNAL_TRANSPORT", "rest")
+KAFKA_TIMEOUT_SEC = float(os.environ.get("KAFKA_REQUEST_TIMEOUT_SEC", "2"))
 
-# ---------------------------------------------------------------------------
-# Kafka config
-# ---------------------------------------------------------------------------
-
-KAFKA_BOOTSTRAP = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
-KAFKA_TIMEOUT_SEC = float(os.environ.get("KAFKA_REQUEST_TIMEOUT_SEC", "15"))
-CHECKOUT_COMMANDS_TOPIC = os.environ.get("KAFKA_CHECKOUT_COMMANDS_TOPIC", "checkout.commands")
-CHECKOUT_REPLIES_TOPIC = os.environ.get("KAFKA_CHECKOUT_REPLIES_TOPIC", "checkout.replies")
-ORCHESTRATOR_GROUP_ID = os.environ.get("KAFKA_ORCHESTRATOR_GROUP_ID", "orchestrator-group")
-
-# KafkaBus handles request-reply with stock/payment services.
-# It reads KAFKA_REPLIES_TOPICS (stock.replies,payment.replies) from env.
 kafka_bus = KafkaBus()
 
 # ---------------------------------------------------------------------------
@@ -482,33 +478,37 @@ async def _recover_in_flight_transactions():
 # Saga execution (the checkout() logic, extracted from order/app.py)
 # ---------------------------------------------------------------------------
 
+@app.post("/checkout")
+async def checkout_http():
+    cmd = await request.get_json(force=True, silent=True)
+    if not cmd:
+        abort(400, "Invalid JSON")
+    result = await run_checkout_saga(cmd)
+    return jsonify(result), result["status_code"]
 
-async def run_checkout_saga(cmd: dict) -> None:
-    """Run the full checkout saga for one order and publish the result."""
-    msg_id = cmd["msg_id"]
+
+async def run_checkout_saga(cmd: dict) -> dict:
+    """Run the full checkout saga for one order and return the result."""
+    msg_id = cmd.get("msg_id", str(uuid.uuid4()))
     order_id = cmd["order_id"]
     user_id = cmd["user_id"]
     total_cost = cmd["total_cost"]
     items = [tuple(i) for i in cmd["items"]]
 
-    async def reply(status_code: int, error: str | None = None, state: str = TX_ABORTED):
-        await kafka_bus.publish(
-            CHECKOUT_REPLIES_TOPIC,
-            {
-                "msg_id": msg_id,
-                "order_id": order_id,
-                "status_code": status_code,
-                "error": error,
-                "state": state,
-            },
-        )
+    def reply(status_code: int, error: str | None = None, state: str = TX_ABORTED) -> dict:
+        return {
+            "msg_id": msg_id,
+            "order_id": order_id,
+            "status_code": status_code,
+            "error": error,
+            "state": state,
+        }
 
     raw_order = await rget(order_id)
     if raw_order:
         order_entry = msgpack.decode(raw_order, type=OrderValue)
         if order_entry.paid:
-            await reply(200, state=TX_COMPLETED)
-            return
+            return reply(200, state=TX_COMPLETED)
 
     tx_id = await _get_or_create_tx_id(order_id)
     resources = _lock_resources_for_order(order_id)
@@ -528,8 +528,7 @@ async def run_checkout_saga(cmd: dict) -> None:
                         )
                         order_entry.paid = True
                         await rset(order_id, msgpack.encode(order_entry))
-                await reply(200, state=TX_COMPLETED)
-                return
+                return reply(200, state=TX_COMPLETED)
 
             if tx.state == TX_ABORTED:
                 logging.info(
@@ -540,8 +539,7 @@ async def run_checkout_saga(cmd: dict) -> None:
                     await rollback_stock(tx)
                     await _save_tx(tx)
                     if tx.reserved_items:
-                        await reply(503, "Compensating transaction in progress, please retry")
-                        return
+                        return reply(503, "Compensating transaction in progress, please retry")
                     tx.stock_released = True
                     await _save_tx(tx)
 
@@ -563,8 +561,7 @@ async def run_checkout_saga(cmd: dict) -> None:
                         tx.tx_id, tx.user_id, tx.total_cost, tx_ts=tx.created_at
                     )
                     if refund_reply.status_code not in (200, 400):
-                        await reply(503, "Compensating refund in progress, please retry")
-                        return
+                        return reply(503, "Compensating refund in progress, please retry")
                     tx.payment_refunded = True
                     await _save_tx(tx)
                     logging.info("[TX:ABORTED-REFUNDED] order=%s old_tx=%s", order_id, tx.tx_id)
@@ -610,8 +607,7 @@ async def run_checkout_saga(cmd: dict) -> None:
                         tx.state = TX_ABORTED
                         tx.error = f"Reserve timed out on item_id: {item_id}"
                         await _save_tx(tx)
-                        await reply(503, tx.error)
-                        return
+                        return reply(503, tx.error)
                     if stock_reply.status_code != 200:
                         if not tx.stock_released:
                             await rollback_stock(tx)
@@ -621,8 +617,7 @@ async def run_checkout_saga(cmd: dict) -> None:
                         tx.state = TX_ABORTED
                         tx.error = f"Out of stock on item_id: {item_id}"
                         await _save_tx(tx)
-                        await reply(400, tx.error)
-                        return
+                        return reply(400, tx.error)
 
                     _add_reserved(tx, item_id, to_reserve)
                     await _save_tx(tx)
@@ -651,8 +646,7 @@ async def run_checkout_saga(cmd: dict) -> None:
                     tx.state = TX_ABORTED
                     tx.error = "User out of credit"
                     await _save_tx(tx)
-                    await reply(400, tx.error)
-                    return
+                    return reply(400, tx.error)
 
                 logging.info(
                     "[TX:CHARGED] order=%s tx=%s user=%s amount=%s",
@@ -671,46 +665,42 @@ async def run_checkout_saga(cmd: dict) -> None:
                 tx.state = TX_COMPLETED
                 await _save_tx(tx)
 
-            await reply(200, state=TX_COMPLETED)
+            return reply(200, state=TX_COMPLETED)
 
     except WaitDieAbort as e:
-        await reply(409, f"Transaction aborted (wait-die): {e}")
+        return reply(409, f"Transaction aborted (wait-die): {e}")
     except LockTimeout as e:
-        await reply(503, f"Could not acquire lock in time: {e}")
+        return reply(503, f"Could not acquire lock in time: {e}")
 
 
 # ---------------------------------------------------------------------------
-# Main event loop
+# HTTP route
 # ---------------------------------------------------------------------------
 
 
-async def main():
+@app.before_serving
+async def startup():
     await kafka_bus.start()
     await _recover_in_flight_transactions()
 
-    consumer = AIOKafkaConsumer(
-        CHECKOUT_COMMANDS_TOPIC,
-        bootstrap_servers=KAFKA_BOOTSTRAP,
-        group_id=ORCHESTRATOR_GROUP_ID,
-        enable_auto_commit=True,
-        auto_offset_reset="earliest",
-    )
-    await consumer.start()
-    logging.info("[ORCHESTRATOR] Listening on %s", CHECKOUT_COMMANDS_TOPIC)
 
-    try:
-        async for msg in consumer:
-            try:
-                cmd = json.loads(msg.value.decode("utf-8"))
-            except Exception as e:
-                logging.warning("[ORCHESTRATOR] Failed to parse message: %s", e)
-                continue
-            asyncio.create_task(run_checkout_saga(cmd))
-    finally:
-        await consumer.stop()
-        await kafka_bus.stop()
-        await asyncio.to_thread(db.close)
+@app.after_serving
+async def shutdown():
+    await kafka_bus.stop()
+    await asyncio.to_thread(db.close)
+
+
+# async def handle_checkout():
+#     cmd = await http_request.get_json(force=True, silent=True)
+#     if not cmd:
+#         abort(400, "Invalid JSON")
+#     required = {"order_id", "user_id", "total_cost", "items"}
+#     missing = required - cmd.keys()
+#     if missing:
+#         abort(400, f"Missing fields: {missing}")
+#     result = await run_checkout_saga(cmd)
+#     return jsonify(result), result["status_code"]
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    app.run(host="0.0.0.0", port=8000, debug=True)

@@ -236,6 +236,14 @@ async def add_item(order_id: str, item_id: str, quantity: int):
     )
 
 
+ORCHESTRATOR_URL = os.environ["ORCHESTRATOR_URL"]
+CHECKOUT_TIMEOUT_SEC = float(os.environ.get("CHECKOUT_TIMEOUT_SEC", "30"))
+
+
+async def _post_checkout(url: str, cmd: dict):
+    return requests.post(url, json=cmd, timeout=CHECKOUT_TIMEOUT_SEC)
+
+
 @app.post('/checkout/<order_id>')
 async def checkout(order_id: str):
     order_entry: OrderValue = await get_order_from_db(order_id)
@@ -250,18 +258,17 @@ async def checkout(order_id: str):
         "items": list(order_entry.items),
     }
     try:
-        reply = await kafka_bus.request(
-            os.environ["KAFKA_CHECKOUT_COMMANDS_TOPIC"],
-            cmd,
-            timeout_sec=KAFKA_TIMEOUT_SEC,
-        )
-    except asyncio.TimeoutError:
+        reply = await _post_checkout(f"{ORCHESTRATOR_URL}/checkout", cmd)
+    except requests.exceptions.RequestException:
         abort(503, "Checkout timed out, please retry")
 
-    status_code = int(reply.get("status_code", 400))
-    if status_code == 200:
+    if reply.status_code == 200:
         return Response("Checkout successful", status=200)
-    abort(status_code, reply.get("error", "Checkout failed"))
+    try:
+        error = reply.json().get("error", "Checkout failed")
+    except Exception:
+        error = "Checkout failed"
+    abort(reply.status_code, error)
 
 
 if __name__ == '__main__':
