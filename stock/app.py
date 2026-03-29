@@ -5,7 +5,7 @@ import os
 import uuid
 
 from kafka_infra import StockKafkaInfrastructure
-from saga_dispatcher import stock_dispatcher, set_redis_client
+from pc_dispatcher import stock_dispatcher, set_redis_client
 import lock_manager
 
 DB_ERROR_STR = "DB error"
