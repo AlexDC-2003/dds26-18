@@ -75,14 +75,20 @@ def _tx_key(tx_id: str) -> str:
 
 
 def _read_tx(tx_id: str):
-    raw = redis_client.get(_tx_key(tx_id))
-    if not raw:
-        return None
-    return json.loads(raw)
+    try:
+        raw = redis_client.get(_tx_key(tx_id))
+        if not raw:
+            return None
+        return json.loads(raw)
+    except (redis.exceptions.RedisError, RuntimeError):
+        raise RuntimeError("DB connection lost")
 
 
 def _write_tx(tx_id: str, tx_doc: dict) -> None:
-    redis_client.set(_tx_key(tx_id), json.dumps(tx_doc), ex=86400)
+    try:
+        redis_client.set(_tx_key(tx_id), json.dumps(tx_doc), ex=86400)
+    except (redis.exceptions.RedisError, RuntimeError):
+        raise RuntimeError("DB connection lost")
 
 
 def _new_tx(command: dict) -> dict:
@@ -103,60 +109,67 @@ def handle_prepare_stock(command):
 
     key = f"item:{item_id}"
     tx_id = command["tx_id"]
-    tx = _read_tx(tx_id) or _new_tx(command)
-    if tx.get("state") == "ABORTED":
-        return build_error(command, "Transaction already aborted")
-    if tx.get("state") == "COMMITTED":
-        return build_success(command, {"item_id": item_id, "prepared": quantity, "state": "COMMITTED"})
+    try:
+        tx = _read_tx(tx_id) or _new_tx(command)
+        if tx.get("state") == "ABORTED":
+            return build_error(command, "Transaction already aborted")
+        if tx.get("state") == "COMMITTED":
+            return build_success(command, {"item_id": item_id, "prepared": quantity, "state": "COMMITTED"})
 
-    prepared_map = tx.setdefault("items", {})
-    already_prepared = int(prepared_map.get(item_id, 0))
-    if already_prepared >= quantity:
-        print(f"Idempotent prepare_stock for item_id: {item_id}, already prepared: {already_prepared} in tx_id: {tx_id}")
-        return build_success(command, {"item_id": item_id, "prepared": already_prepared, "state": tx.get("state", "PREPARED")})
+        prepared_map = tx.setdefault("items", {})
+        already_prepared = int(prepared_map.get(item_id, 0))
+        if already_prepared >= quantity:
+            print(f"Idempotent prepare_stock for item_id: {item_id}, already prepared: {already_prepared} in tx_id: {tx_id}")
+            return build_success(command, {"item_id": item_id, "prepared": already_prepared, "state": tx.get("state", "PREPARED")})
 
-    lock_ok, lock_error = acquire_lock(item_id, tx_id)
-    if not lock_ok:
-        print(f"Failed to acquire lock for item_id: {item_id} in tx_id: {tx_id}: {lock_error}")
-        if lock_error and "wait-die" in lock_error:
-            raise WaitDieAbort(lock_error)
-        return build_error(command, lock_error)
-    print(f"Acquired lock for item_id: {item_id} in tx_id: {tx_id}")
-    if not redis_client.exists(key):
-        print(f"Item not found for item_id: {item_id} in tx_id: {tx_id}")
-        release_lock(item_id, tx_id)
-        return build_error(command, "Item not found")
+        lock_ok, lock_error = acquire_lock(item_id, tx_id)
+        if not lock_ok:
+            print(f"Failed to acquire lock for item_id: {item_id} in tx_id: {tx_id}: {lock_error}")
+            if lock_error and "wait-die" in lock_error:
+                raise WaitDieAbort(lock_error)
+            if lock_error and ("connection" in lock_error.lower() or "db error" in lock_error.lower()):
+                return build_error(command, "DB connection lost")
+            return build_error(command, lock_error)
+        print(f"Acquired lock for item_id: {item_id} in tx_id: {tx_id}")
+        if not redis_client.exists(key):
+            print(f"Item not found for item_id: {item_id} in tx_id: {tx_id}")
+            release_lock(item_id, tx_id)
+            return build_error(command, "Item not found")
 
-    current_stock = int(redis_client.hget(key, "stock"))
-    if current_stock < quantity:
-        print(f"Insufficient stock for item_id: {item_id}, requested: {quantity}, available: {current_stock} in tx_id: {tx_id}")
-        release_lock(item_id, tx_id)
-        return build_error(command, "Insufficient stock")
+        current_stock = int(redis_client.hget(key, "stock"))
+        if current_stock < quantity:
+            print(f"Insufficient stock for item_id: {item_id}, requested: {quantity}, available: {current_stock} in tx_id: {tx_id}")
+            release_lock(item_id, tx_id)
+            return build_error(command, "Insufficient stock")
 
-    prepared_map[item_id] = quantity
-    tx["state"] = "PREPARED"
-    tx["updated_at"] = time.time()
-    _write_tx(tx_id, tx)
-    print(f"Prepared stock for item_id: {item_id}, quantity: {quantity} in tx_id: {tx_id}")
-    return build_success(command, {"item_id": item_id, "prepared": quantity, "state": "PREPARED"})
+        prepared_map[item_id] = quantity
+        tx["state"] = "PREPARED"
+        tx["updated_at"] = time.time()
+        _write_tx(tx_id, tx)
+        print(f"Prepared stock for item_id: {item_id}, quantity: {quantity} in tx_id: {tx_id}")
+        return build_success(command, {"item_id": item_id, "prepared": quantity, "state": "PREPARED"})
+
+    except (redis.exceptions.RedisError, RuntimeError) as e:
+        return build_error(command, "DB connection lost")
+
 
 def handle_commit_stock(command):
     print(f"Handling commit_stock for tx_id: {command['tx_id']}")
     tx_id = command["tx_id"]
-    tx = _read_tx(tx_id)
+    try:
+        tx = _read_tx(tx_id)
 
-    if tx is None:
-        return build_success(command, {"state": "COMMITTED", "noop": True})
-    if tx.get("state") == "ABORTED":
-        return build_error(command, "Transaction already aborted")
-    if tx.get("state") == "COMMITTED":
-        return build_success(command, {"state": "COMMITTED", "noop": True})
+        if tx is None:
+            return build_success(command, {"state": "COMMITTED", "noop": True})
+        if tx.get("state") == "ABORTED":
+            return build_error(command, "Transaction already aborted")
+        if tx.get("state") == "COMMITTED":
+            return build_success(command, {"state": "COMMITTED", "noop": True})
 
-    items = tx.get("items", {})
-    for item_id in sorted(items.keys()):
-        quantity = int(items[item_id])
-        key = f"item:{item_id}"
-        try:
+        items = tx.get("items", {})
+        for item_id in sorted(items.keys()):
+            quantity = int(items[item_id])
+            key = f"item:{item_id}"
             if not redis_client.exists(key):
                 release_lock(item_id, tx_id)
                 return build_error(command, "Item not found")
@@ -177,40 +190,38 @@ def handle_commit_stock(command):
                     except redis.WatchError:
                         continue
 
-        except Exception as e:
+        tx["state"] = "COMMITTED"
+        tx["updated_at"] = time.time()
+        _write_tx(tx_id, tx)
+
+        for item_id in sorted(items.keys()):
             release_lock(item_id, tx_id)
-            print(f"DB error during commit for item_id: {item_id} in tx_id: {tx_id}: {e}")
-            return build_error(command, f"DB error during commit: {e}")
 
-        # release_lock(item_id, tx_id)
+        print(f"Committed stock for tx_id: {tx_id}; item id: {item_id}, quantity: {quantity}")
+        return build_success(command, {"state": "COMMITTED"})
 
-    tx["state"] = "COMMITTED"
-    tx["updated_at"] = time.time()
-    _write_tx(tx_id, tx)
+    except (redis.exceptions.RedisError, RuntimeError) as e:
 
-    for item_id in sorted(items.keys()):
-        release_lock(item_id, tx_id)
-
-    print(f"Committed stock for tx_id: {tx_id}; item id: {item_id}, quantity: {quantity}")
-    return build_success(command, {"state": "COMMITTED"})
+        print(f"DB error during commit for tx_id: {tx_id}: {e}")
+        return build_error(command, "DB connection lost")
 
 
 def handle_abort_stock(command):
     tx_id = command["tx_id"]
-    tx = _read_tx(tx_id)
-    if tx is None:
-        return build_success(command, {"state": "ABORTED", "noop": True})
-    if tx.get("state") == "ABORTED":
-        return build_success(command, {"state": "ABORTED", "noop": True})
-    if tx.get("state") == "COMMITTED":
-        return build_error(command, "Transaction already committed")
+    try:
+        tx = _read_tx(tx_id)
+        if tx is None or tx.get("state") == "ABORTED":
+            return build_success(command, {"state": "ABORTED", "noop": True})
+        if tx.get("state") == "COMMITTED":
+            return build_error(command, "Transaction already committed")
 
-    items = tx.get("items", {})
-    for item_id in sorted(items.keys()):
-        release_lock(item_id, tx_id)
+        items = tx.get("items", {})
+        for item_id in sorted(items.keys()):
+            release_lock(item_id, tx_id)
 
-    tx["state"] = "ABORTED"
-    tx["updated_at"] = time.time()
-    _write_tx(tx_id, tx)
-    print(f"Aborted stock transaction for tx_id: {tx_id}")
-    return build_success(command, {"state": "ABORTED"})
+        tx["state"] = "ABORTED"
+        tx["updated_at"] = time.time()
+        _write_tx(tx_id, tx)
+        return build_success(command, {"state": "ABORTED"})
+    except (redis.exceptions.RedisError, RuntimeError):
+        return build_error(command, "DB connection lost")

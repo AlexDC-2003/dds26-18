@@ -36,12 +36,14 @@ atexit.register(close_db_connection)
 class UserValue(Struct):
     credit: int
 
+class _DatabaseTransientError(Exception):
+    pass
 
 def get_user_from_db(user_id: str) -> UserValue:
     try:
         entry: bytes = db.get(user_id)
-    except redis.exceptions.RedisError:
-        abort(400, DB_ERROR_STR)
+    except (redis.exceptions.RedisError, ConnectionError):
+        raise _DatabaseTransientError("Payment DB is starting up...")
 
     user: UserValue | None = msgpack.decode(entry, type=UserValue) if entry else None
     if user is None:
@@ -66,8 +68,8 @@ def _update_credit_2pl(user_id: str, delta: int) -> int:
             # ---- Growing phase complete ----
             try:
                 raw = db.get(user_id)
-            except redis.exceptions.RedisError:
-                abort(400, DB_ERROR_STR)
+            except (redis.exceptions.RedisError, RuntimeError):
+                raise _DatabaseTransientError("Payment DB connection lost")
 
             if not raw:
                 abort(400, f"User: {user_id} not found!")
@@ -82,8 +84,8 @@ def _update_credit_2pl(user_id: str, delta: int) -> int:
 
             try:
                 db.set(user_id, msgpack.encode(user))
-            except redis.exceptions.RedisError:
-                abort(400, DB_ERROR_STR)
+            except (redis.exceptions.RedisError, RuntimeError):
+                raise _DatabaseTransientError("Payment DB connection lost")
 
             return new_credit
 

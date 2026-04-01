@@ -25,6 +25,8 @@ class Payment2PCTxValue(Struct):
     credit_after_prepare: int
     ts: float
 
+class _DatabaseTransientError(Exception):
+    pass
 
 class PaymentKafkaWorker:
     """Kafka command handler for the Payment service.
@@ -190,8 +192,10 @@ class PaymentKafkaWorker:
                 err = reply.get("error") or ""
                 if err.startswith("Payment wait-die abort") or err.startswith("Payment lock timeout"):
                     raise _LockRetry(reply["error"])
+                if "DB connection lost" in err:
+                    raise _DatabaseTransientError(err)
                 break
-            except (WaitDieAbort, LockTimeout, _LockRetry) as e:
+            except (WaitDieAbort, LockTimeout, _LockRetry, _DatabaseTransientError) as e:
                 if attempt < MAX_RETRIES:
                     print(f"[2PL] Wait-Die retry {attempt}/{MAX_RETRIES} for msg_id={cmd.get('msg_id')}")
                     await asyncio.sleep(backoff)
@@ -296,8 +300,8 @@ class PaymentKafkaWorker:
             return False, f"Payment wait-die abort: {e}"
         except LockTimeout as e:
             return False, f"Payment lock timeout: {e}"
-        except redis.exceptions.RedisError as e:
-            return False, f"Payment DB error: {e}"
+        except (redis.exceptions.RedisError, RuntimeError) as e:
+            return False, f"DB connection lost: {e}"
 
     def _release_tx_locks(self, tx_id: str) -> None:
         txn = self._tx_contexts.pop(tx_id, None)
@@ -319,31 +323,29 @@ class PaymentKafkaWorker:
             return False, "amount must be > 0", None
 
         tx_key = f"pay_2pc_tx:{tx_id}"
-
-        # Fast idempotency check.
-        existing = self._db.get(tx_key)
-        if existing:
-            tx = msgpack.decode(existing, type=Payment2PCTxValue)
-            if tx.state == "ABORTED":
-                return False, "transaction already aborted", None
-            print(f"Idempotent prepare_payment for user_id: {user_id}, already prepared in tx_id: {tx_id}")
-            return True, None, tx.credit_after_prepare
-
-        lock_ok, lock_err = self._acquire_user_lock(tx_id, user_id, tx_ts=tx_ts)
-        if not lock_ok:
-            print(f"[2PL] Failed to acquire lock for user_id: {user_id} in tx_id: {tx_id}: {lock_err}")
-            return False, lock_err, None
-        print(f"Acquired lock for user_id: {user_id} in tx_id: {tx_id}")
-
         try:
-            existing2 = self._db.get(tx_key)
-            if existing2:
-                tx = msgpack.decode(existing2, type=Payment2PCTxValue)
+            existing = self._db.get(tx_key)
+            if existing:
+                tx = msgpack.decode(existing, type=Payment2PCTxValue)
                 if tx.state == "ABORTED":
                     return False, "transaction already aborted", None
                 print(f"Idempotent prepare_payment for user_id: {user_id}, already prepared in tx_id: {tx_id}")
                 return True, None, tx.credit_after_prepare
 
+            lock_ok, lock_err = self._acquire_user_lock(tx_id, user_id, tx_ts=tx_ts)
+            if not lock_ok:
+                print(f"[2PL] Failed to acquire lock for user_id: {user_id} in tx_id: {tx_id}: {lock_err}")
+                return False, lock_err, None
+            print(f"Acquired lock for user_id: {user_id} in tx_id: {tx_id}")
+
+            existing2 = self._db.get(tx_key)
+            if existing2:
+                tx = msgpack.decode(existing2, type=Payment2PCTxValue)
+                if tx.state == "ABORTED":
+                    return False, "transaction already aborted", None
+                return True, None, tx.credit_after_prepare
+
+            # 4. Perform the balance check and record preparation
             raw_user = self._db.get(user_id)
             if not raw_user:
                 print(f"User not found for user_id: {user_id} in tx_id: {tx_id}")
@@ -366,9 +368,13 @@ class PaymentKafkaWorker:
             self._db.set(tx_key, msgpack.encode(tx_record))
             print(f"Prepared payment for user_id: {user_id}, amount: {amount} in tx_id: {tx_id}")
             return True, None, user.credit
-        except redis.exceptions.RedisError as e:
-            self._release_tx_locks(tx_id)
-            return False, f"DB error: {e}", None
+
+        except (redis.exceptions.RedisError, RuntimeError) as e:
+            try:
+                self._release_tx_locks(tx_id)
+            except:
+                pass
+            return False, "DB connection lost: Payment DB starting up", None
 
     def _commit_payment(
         self,
@@ -403,31 +409,33 @@ class PaymentKafkaWorker:
             print(f"Committed payment for user_id: {tx.user_id}, amount: {tx.amount} in tx_id: {tx_id}")
             return True, None
 
-        except redis.exceptions.RedisError as e:
-            return False, f"DB error: {e}"
+        except (redis.exceptions.RedisError, RuntimeError) as e:
+            return False, "DB connection lost: Payment DB starting up"
         finally:
             self._release_tx_locks(tx_id)
 
     def _abort_payment(
-        self,
-        tx_id: str,
-        *,
-        tx_ts: Optional[float] = None,
+            self,
+            tx_id: str,
+            *,
+            tx_ts: Optional[float] = None,
     ) -> Tuple[bool, Optional[str]]:
         tx_key = f"pay_2pc_tx:{tx_id}"
-        raw = self._db.get(tx_key)
-        if not raw:
-            return True, None
-        tx = msgpack.decode(raw, type=Payment2PCTxValue)
-        if tx.state == "ABORTED":
-            return True, None
-        if tx.state == "COMMITTED":
-            return False, "transaction already committed"
-
         try:
+            raw = self._db.get(tx_key)
+            if not raw:
+                return True, None
+            tx = msgpack.decode(raw, type=Payment2PCTxValue)
+            if tx.state == "ABORTED":
+                return True, None
+            if tx.state == "COMMITTED":
+                return False, "transaction already committed"
+
             tx.state = "ABORTED"
             self._db.set(tx_key, msgpack.encode(tx))
             self._release_tx_locks(tx_id)
+            print(f"Aborted payment for tx_id: {tx_id}")
             return True, None
-        except redis.exceptions.RedisError as e:
-            return False, f"DB error: {e}"
+
+        except (redis.exceptions.RedisError, RuntimeError) as e:
+            return False, "DB connection lost: Payment DB starting up"

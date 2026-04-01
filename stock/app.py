@@ -24,6 +24,9 @@ class StockValue(Struct):
     stock: int
     price: int
 
+class _DatabaseTransientError(Exception):
+    pass
+
 set_redis_client(redis_client)
 lock_manager.set_redis_client(redis_client)  # shared redis into lock manager
 
