@@ -187,8 +187,8 @@ def _as_response_like(reply: dict, *, service: str):
 async def get_order_from_db(order_id: str) -> OrderValue:
     try:
         entry: bytes | None = await rget(order_id)
-    except redis.exceptions.RedisError:
-        abort(400, DB_ERROR_STR)
+    except (redis.exceptions.RedisError, RuntimeError):
+        raise _DatabaseTransientError("Could not reach Order DB")
 
     order: OrderValue | None = msgpack.decode(entry, type=OrderValue) if entry else None
     if order is None:
@@ -206,8 +206,8 @@ def _tx_key(tx_id: str) -> str:
 async def _get_or_create_tx_id(order_id: str) -> str:
     try:
         existing = await rget(_order_tx_key(order_id))
-    except redis.exceptions.RedisError:
-        abort(400, DB_ERROR_STR)
+    except (redis.exceptions.RedisError, RuntimeError):
+        raise _DatabaseTransientError("Redis connecting...")
 
     if existing:
         return existing.decode()
@@ -215,16 +215,16 @@ async def _get_or_create_tx_id(order_id: str) -> str:
     new_tx_id = str(uuid.uuid4())
     try:
         ok = await rset(_order_tx_key(order_id), new_tx_id, nx=True)
-    except redis.exceptions.RedisError:
-        abort(400, DB_ERROR_STR)
+    except (redis.exceptions.RedisError, RuntimeError):
+        raise _DatabaseTransientError("Redis connecting...")
 
     if ok:
         return new_tx_id
 
     try:
         existing2 = await rget(_order_tx_key(order_id))
-    except redis.exceptions.RedisError:
-        abort(400, DB_ERROR_STR)
+    except (redis.exceptions.RedisError, RuntimeError):
+        raise _DatabaseTransientError("Redis connecting...")
 
     return existing2.decode() if existing2 else new_tx_id
 
@@ -232,8 +232,8 @@ async def _get_or_create_tx_id(order_id: str) -> str:
 async def _get_tx(tx_id: str) -> OrderTxValue | None:
     try:
         raw = await rget(_tx_key(tx_id))
-    except redis.exceptions.RedisError:
-        abort(400, DB_ERROR_STR)
+    except (redis.exceptions.RedisError, RuntimeError):
+        raise _DatabaseTransientError("Redis is starting up...")
     return msgpack.decode(raw, type=OrderTxValue) if raw else None
 
 
@@ -241,8 +241,8 @@ async def _save_tx(tx: OrderTxValue) -> None:
     tx.updated_at = time.time()
     try:
         await rset(_tx_key(tx.tx_id), msgpack.encode(tx))
-    except redis.exceptions.RedisError:
-        abort(400, DB_ERROR_STR)
+    except (redis.exceptions.RedisError, RuntimeError):
+        raise _DatabaseTransientError("Redis is starting up...")
 
 
 async def _get_or_create_tx_record(tx_id: str, order_id: str, order_entry: OrderValue) -> OrderTxValue:
@@ -270,8 +270,8 @@ async def _get_or_create_tx_record(tx_id: str, order_id: str, order_entry: Order
 
     try:
         ok = await rset(_tx_key(tx_id), msgpack.encode(tx), nx=True)
-    except redis.exceptions.RedisError:
-        abort(400, DB_ERROR_STR)
+    except (redis.exceptions.RedisError, RuntimeError):
+        raise _DatabaseTransientError("Redis connecting...")
 
     if ok:
         return tx
@@ -477,6 +477,9 @@ async def add_item(order_id: str, item_id: str, quantity: int):
 class _LockContention(Exception):
     """Transient 2PL wait-die abort from a downstream service; safe to retry."""
 
+class _DatabaseTransientError(Exception):
+    """Raised when Redis is temporarily unavailable during a restart."""
+
 
 def _is_lock_error(err: str | None) -> bool:
     if not err:
@@ -619,33 +622,38 @@ async def checkout(order_id: str):
     MAX_RETRIES = 5
     backoff = 0.2
     for attempt in range(MAX_RETRIES + 1):
-        order_entry = await get_order_from_db(order_id)
-        if order_entry.paid:
-            return Response("Checkout successful", status=200)
+        try:
+            order_entry = await get_order_from_db(order_id)
+            if order_entry.paid:
+                return Response("Checkout successful", status=200)
 
-        tx_id = await _get_or_create_tx_id(order_id)
-        result = await _run_transaction_2pc(order_id, tx_id, order_entry)
+            tx_id = await _get_or_create_tx_id(order_id)
+            result = await _run_transaction_2pc(order_id, tx_id, order_entry)
 
-        if result["status"] == "committed":
-            return Response("Checkout successful", status=200)
+            if result["status"] == "committed":
+                return Response("Checkout successful", status=200)
 
-        if result["status"] in ("lock_contention", "timeout"):
+            if result["status"] in ("lock_contention", "timeout"):
+                if attempt < MAX_RETRIES:
+                    if result.get("error") == "orchestrator restarted":
+                        new_id = str(uuid.uuid4())
+                        await rset(_order_tx_key(order_id), new_id.encode())
+                    await asyncio.sleep(backoff)
+                    backoff = min(backoff * 2, 2.0)
+                    continue
+                abort(503, result.get("error", "System busy"))
+
+            if result["status"] == "aborted":
+                new_id = str(uuid.uuid4())
+                await rset(_order_tx_key(order_id), new_id.encode())
+                abort(400, result.get("error", "Transaction aborted"))
+        except _DatabaseTransientError as e:
             if attempt < MAX_RETRIES:
-                if result.get("error") == "orchestrator restarted":
-                    # Generate a new ID if recovery scan killed the previous one
-                    new_id = str(uuid.uuid4())
-                    await rset(_order_tx_key(order_id), new_id.encode())
+                print(f"Database transient error: {e}. Retrying...", flush=True)
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 2.0)
                 continue
-            abort(503, result.get("error", "System busy"))
-
-        if result["status"] == "aborted":
-            new_id = str(uuid.uuid4())
-            await rset(_order_tx_key(order_id), new_id.encode())
-            abort(400, result.get("error", "Transaction aborted"))
-
-        abort(400, "Unknown error")
+            abort(503, "Database unavailable")
 
 if __name__ == '__main__':
     app.run(host="0.0.0.0", port=8000, debug=True)
