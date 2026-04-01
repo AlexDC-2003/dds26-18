@@ -54,5 +54,14 @@ This starts the gateway, all three services, their Redis instances, Kafka, ZooKe
 
 We include a watchdog container that monitors the service and database containers and restarts them if they crash. This is useful during fault-tolerance experiments and test scenarios where containers are intentionally killed during checkout.
 
+## Scalability
+
+Docker compose files - docker-compose.yml , docker-compose-medium.yml (50), docker-compose-large.yml (90)
+
+Run like:
+docker compose -f docker-compose-medium.yml down -v
+docker compose -f docker-compose-medium.yml up --build -d
+
+For large, change partitions to 4 in create_topics.sh 
 
 
