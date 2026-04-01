@@ -146,8 +146,17 @@ class StockKafkaInfrastructure:
             #     return
             try:
                 reply = await loop.run_in_executor(None, self.dispatcher, command)
+                err = str(reply.get("error") or "")
+                if "DB connection lost" in err:
+                    raise RuntimeError("Transient DB error")
                 break
             except (RuntimeError, SyntaxError, AttributeError) as e:
+                if str(e) == "Transient DB error":
+                    if attempt < MAX_RETRIES:
+                        print(f"[Stock-Retry] DB connection lost. Retry {attempt}/{MAX_RETRIES} for msg_id={command.get('msg_id')}")
+                        await asyncio.sleep(backoff)
+                        backoff = min(backoff * 2, 1.0)
+                        continue
                 # If the interpreter is dying, exit this function silently.
                 if "shutdown" in str(e).lower() or "none" in str(e).lower():
                     return

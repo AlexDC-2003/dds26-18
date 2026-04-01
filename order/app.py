@@ -70,8 +70,8 @@ def _order_tx_key(order_id: str) -> str:
 async def _get_or_create_tx_id(order_id: str) -> str:
     try:
         existing = await rget(_order_tx_key(order_id))
-    except redis.exceptions.RedisError:
-        abort(400, DB_ERROR_STR)
+    except (redis.exceptions.RedisError, RuntimeError):
+        raise _DatabaseTransientError("Redis connecting...")
 
     if existing:
         return existing.decode()
@@ -79,16 +79,16 @@ async def _get_or_create_tx_id(order_id: str) -> str:
     new_tx_id = str(uuid.uuid4())
     try:
         ok = await rset(_order_tx_key(order_id), new_tx_id, nx=True)
-    except redis.exceptions.RedisError:
-        abort(400, DB_ERROR_STR)
+    except (redis.exceptions.RedisError, RuntimeError):
+        raise _DatabaseTransientError("Redis connecting...")
 
     if ok:
         return new_tx_id
 
     try:
         existing2 = await rget(_order_tx_key(order_id))
-    except redis.exceptions.RedisError:
-        abort(400, DB_ERROR_STR)
+    except (redis.exceptions.RedisError, RuntimeError):
+        raise _DatabaseTransientError("Redis connecting...")
 
     return existing2.decode() if existing2 else new_tx_id
 
@@ -107,12 +107,14 @@ async def async_2pl(resources: list[str], *, tx_id: str | None = None, ts: float
 def _lock_resources_for_order(order_id: str) -> list[str]:
     return [f"order:{order_id}", f"order_tx:{order_id}"]
 
+class _DatabaseTransientError(Exception):
+    """Raised when Redis is temporarily unavailable during a restart."""
 
 async def get_order_from_db(order_id: str) -> OrderValue:
     try:
         entry: bytes | None = await rget(order_id)
-    except redis.exceptions.RedisError:
-        abort(400, DB_ERROR_STR)
+    except (redis.exceptions.RedisError, RuntimeError):
+        raise _DatabaseTransientError("Could not reach Order DB")
 
     order: OrderValue | None = msgpack.decode(entry, type=OrderValue) if entry else None
     if order is None:
@@ -290,6 +292,9 @@ async def checkout(order_id: str):
                     abort(400, result.get("error", "Checkout failed"))
 
                 elif status == "timeout":
+                    err_msg = result.get("error", "")
+                    if "DB connection lost" in err_msg:
+                        raise _DatabaseTransientError(err_msg)
                     # Retriable — fresh tx_id and retry like lock contention
                     new_tx_id = str(uuid.uuid4())
                     await rset(_order_tx_key(order_id), new_tx_id)
@@ -298,7 +303,7 @@ async def checkout(order_id: str):
                 else:  # unexpected
                     abort(503, result.get("error", "Orchestrator error"))
 
-        except (_LockContention, WaitDieAbort) as e:
+        except (_LockContention, WaitDieAbort, _DatabaseTransientError, LockTimeout) as e:
             if attempt < MAX_RETRIES:
                 print(f"[Checkout] Retrying attempt {attempt + 1}/{MAX_RETRIES + 1}: {e}", flush=True)
                 await asyncio.sleep(backoff)

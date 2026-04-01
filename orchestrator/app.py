@@ -33,6 +33,9 @@ ORCHESTRATOR_REPLIES_TOPIC = os.environ.get("KAFKA_ORCHESTRATOR_REPLIES_TOPIC", 
 kafka_bus = KafkaBus()
 _commands_consumer: AIOKafkaConsumer | None = None
 
+class _DatabaseTransientError(Exception):
+    """Raised when Redis is temporarily unavailable during a restart."""
+    pass
 
 @app.before_serving
 async def startup():
@@ -104,8 +107,8 @@ def _tx_key(tx_id: str) -> str:
 async def _get_tx(tx_id: str) -> TxRecord | None:
     try:
         raw = await rget(_tx_key(tx_id))
-    except redis.exceptions.RedisError:
-        abort(400, DB_ERROR_STR)
+    except (redis.exceptions.RedisError, RuntimeError):
+        raise _DatabaseTransientError("Redis is starting up...")
     return msgpack.decode(raw, type=TxRecord) if raw else None
 
 
@@ -113,8 +116,8 @@ async def _save_tx(tx: TxRecord) -> None:
     tx.updated_at = time.time()
     try:
         await rset(_tx_key(tx.tx_id), msgpack.encode(tx))
-    except redis.exceptions.RedisError:
-        abort(400, DB_ERROR_STR)
+    except (redis.exceptions.RedisError, RuntimeError):
+        raise _DatabaseTransientError("Redis is starting up...")
 
 
 async def _get_or_create_tx_record(
@@ -147,8 +150,8 @@ async def _get_or_create_tx_record(
     )
     try:
         ok = await rset(_tx_key(tx_id), msgpack.encode(tx), nx=True)
-    except redis.exceptions.RedisError:
-        abort(400, DB_ERROR_STR)
+    except (redis.exceptions.RedisError, RuntimeError):
+        raise _DatabaseTransientError("Redis is starting up...")
 
     if ok:
         return tx
@@ -392,10 +395,10 @@ async def _run_transaction(body: dict) -> dict:
                     r = await commit_payment(tx.tx_id, tx_ts=tx.created_at)
                     if r.status_code == 200:
                         tx.payment_committed = True
+                        await _save_tx(tx)
                         print(f"Committed payment user={tx.user_id} tx={tx.tx_id}", flush=True)
                     else:
                         tx.error = "Failed to commit payment, retrying"
-                    await _save_tx(tx)
                 except Exception:
                     pass
 
@@ -404,10 +407,10 @@ async def _run_transaction(body: dict) -> dict:
                     r = await commit_stock(tx.tx_id, tx_ts=tx.created_at)
                     if r.status_code == 200:
                         tx.stock_committed = True
+                        await _save_tx(tx)
                         print(f"Committed stock order={order_id} tx={tx.tx_id}", flush=True)
                     else:
                         tx.error = "Failed to commit stock, retrying"
-                    await _save_tx(tx)
                 except Exception:
                     pass
 
@@ -438,6 +441,8 @@ async def _handle_command(data: dict) -> None:
     msg_id = data.get("msg_id")
     try:
         result = await _run_transaction(data)
+    except _DatabaseTransientError as e:
+        result = {"status": "timeout", "error": f"DB connection lost: {e}"}
     except Exception as e:
         result = {"status": "aborted", "error": f"Internal error: {e}"}
     result["msg_id"] = msg_id
