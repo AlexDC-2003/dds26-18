@@ -31,8 +31,8 @@ db: redis.Redis = redis.Redis(host=os.environ['REDIS_HOST'],
 
 lock_manager = LockManager(db=db)
 INTERNAL_TRANSPORT = os.environ.get("INTERNAL_TRANSPORT", "rest")
-KAFKA_TIMEOUT_SEC = float(os.environ.get("KAFKA_REQUEST_TIMEOUT_SEC", "6"))
-COMMIT_RETRY_TIMEOUT_SEC = float(os.environ.get("KAFKA_COMMIT_RETRY_TIMEOUT_SEC", "8"))
+KAFKA_TIMEOUT_SEC = float(os.environ.get("KAFKA_REQUEST_TIMEOUT_SEC", "15"))
+COMMIT_RETRY_TIMEOUT_SEC = float(os.environ.get("KAFKA_COMMIT_RETRY_TIMEOUT_SEC", "20"))
 COMMIT_RETRY_SLEEP_SEC = float(os.environ.get("KAFKA_COMMIT_RETRY_SLEEP_SEC", "0.05"))
 
 kafka_bus = KafkaBus()
@@ -55,10 +55,46 @@ async def http_get(url: str):
 async def http_post(url: str):
     return await asyncio.to_thread(send_post_request, url)
 
+
+async def _recover_pending_transactions():
+    lock_key = "order_service:recovery_lock"
+    acquired = await rset(lock_key, "1", nx=True, ex=60)
+    if not acquired:
+        return
+
+    print("Starting Order Service recovery scan...", flush=True)
+    try:
+        cursor = 0
+        while True:
+            cursor, keys = await asyncio.to_thread(db.scan, cursor, match=f"{TX_KEY_PREFIX}*", count=100)
+            for key in keys:
+                raw = await rget(key.decode())
+                if not raw: continue
+
+                tx = msgpack.decode(raw, type=OrderTxValue)
+                if tx.state in (TX_COMPLETED, TX_ABORTED):
+                    continue
+
+                if tx.state in (TX_STARTED, TX_PREPARING):
+                    print(f"Recovery: Aborting stuck tx {tx.tx_id}", flush=True)
+                    tx.state = TX_ABORTED
+                    tx.error = "__crash_abort__"
+                    await _save_tx(tx)
+                    await _abort_participants(tx)
+                elif tx.state in (TX_PREPARED, TX_COMMITTING):
+                    print(f"Recovery: Resuming commit for tx {tx.tx_id}", flush=True)
+                    order_entry = await get_order_from_db(tx.order_id)
+                    asyncio.create_task(_run_transaction_2pc(tx.order_id, tx.tx_id, order_entry))
+
+            if cursor == 0: break
+    finally:
+        await asyncio.to_thread(db.delete, lock_key)
+
 @app.before_serving
 async def startup():
     if INTERNAL_TRANSPORT == "kafka":
         await kafka_bus.start()
+        await _recover_pending_transactions()
 
 @app.after_serving
 async def shutdown():
@@ -477,162 +513,135 @@ async def _abort_participants(tx: OrderTxValue) -> None:
             pass
 
 
+async def _run_transaction_2pc(order_id: str, tx_id: str, order_entry: OrderValue) -> dict:
+    resources = _lock_resources_for_order(order_id)
+    try:
+        async with async_2pl(resources, tx_id=tx_id, ts=None):
+            tx = await _get_or_create_tx_record(tx_id, order_id, order_entry)
+
+            if tx.state == TX_COMPLETED:
+                return {"status": "committed"}
+
+            # Handle the crash sentinel
+            if tx.state == TX_ABORTED:
+                if tx.error == "__crash_abort__":
+                    return {"status": "timeout", "error": "orchestrator restarted"}
+                if _is_lock_error(tx.error):
+                    return {"status": "lock_contention", "error": tx.error}
+                return {"status": "aborted", "error": tx.error or "previously aborted"}
+
+            items_quantities: dict[str, int] = defaultdict(int)
+            for item_id, quantity in tx.items:
+                items_quantities[item_id] += quantity
+
+            # --- Prepare phase ---
+            if tx.state in (TX_STARTED, TX_PREPARING):
+                tx.state = TX_PREPARING
+                await _save_tx(tx)
+                prepared_now = _prepared_as_dict(tx.prepared_items)
+                for item_id, quantity in items_quantities.items():
+                    if prepared_now.get(item_id, 0) >= quantity: continue
+                    try:
+                        stock_reply = await prepare_stock(tx.tx_id, item_id, quantity, tx_ts=tx.created_at)
+                    except asyncio.TimeoutError:
+                        return {"status": "timeout"}  # Soft error, let outer loop retry
+
+                    if stock_reply.status_code != 200:
+                        err_msg = stock_reply.json().get("error") or "Stock error"
+                        if _is_lock_error(err_msg):
+                            return {"status": "lock_contention", "error": err_msg}
+
+                        tx.state = TX_ABORTED
+                        tx.error = err_msg
+                        await _save_tx(tx)
+                        await _abort_participants(tx)
+                        return {"status": "aborted", "error": tx.error}
+                    _set_prepared_qty(tx, item_id, quantity)
+                    tx.stock_prepared = True
+                    await _save_tx(tx)
+
+                if not tx.payment_prepared:
+                    try:
+                        user_reply = await prepare_payment(tx.tx_id, tx.user_id, tx.total_cost, tx_ts=tx.created_at)
+                    except asyncio.TimeoutError:
+                        return {"status": "timeout"}
+
+                    if user_reply.status_code != 200:
+                        pay_err = user_reply.json().get("error") or "Payment error"
+                        if _is_lock_error(pay_err):
+                            return {"status": "lock_contention", "error": pay_err}
+
+                        tx.state = TX_ABORTED
+                        tx.error = pay_err
+                        await _save_tx(tx)
+                        await _abort_participants(tx)
+                        return {"status": "aborted", "error": tx.error}
+                    tx.payment_prepared = True
+                    await _save_tx(tx)
+
+                tx.state = TX_PREPARED
+                await _save_tx(tx)
+
+            # --- Commit phase ---
+            if tx.state in (TX_PREPARED, TX_COMMITTING):
+                tx.state = TX_COMMITTING
+                await _save_tx(tx)
+                while not (tx.payment_committed and tx.stock_committed):
+                    if not tx.payment_committed:
+                        try:
+                            r = await commit_payment(tx.tx_id, tx_ts=tx.created_at)
+                            if r.status_code == 200: tx.payment_committed = True
+                            await _save_tx(tx)
+                        except Exception:
+                            pass
+                    if not tx.stock_committed:
+                        try:
+                            r = await commit_stock(tx.tx_id, tx_ts=tx.created_at)
+                            if r.status_code == 200: tx.stock_committed = True
+                            await _save_tx(tx)
+                        except Exception:
+                            pass
+                    if not (tx.payment_committed and tx.stock_committed):
+                        await asyncio.sleep(COMMIT_RETRY_SLEEP_SEC)
+
+                order_entry.paid = True
+                await rset(order_id, msgpack.encode(order_entry))
+                tx.state = TX_COMPLETED
+                await _save_tx(tx)
+
+            return {"status": "committed"}
+
+    except (_LockContention, WaitDieAbort) as e:
+        return {"status": "lock_contention", "error": str(e)}
+
 @app.post('/checkout/<order_id>')
 async def checkout(order_id: str):
     MAX_RETRIES = 5
     backoff = 0.2
     for attempt in range(MAX_RETRIES + 1):
-        order_entry: OrderValue = await get_order_from_db(order_id)
+        order_entry = await get_order_from_db(order_id)
         if order_entry.paid:
             return Response("Checkout successful", status=200)
 
         tx_id = await _get_or_create_tx_id(order_id)
-        resources = _lock_resources_for_order(order_id)
+        result = await _run_transaction_2pc(order_id, tx_id, order_entry)
 
-        try:
-            # Acquire locks first (2PL discipline)
-            async with async_2pl(resources, tx_id=tx_id, ts=None):
-                # Create/read tx inside lock
-                print(f"Acquired locks for order_id: {order_id}, tx_id: {tx_id}")
-                tx = await _get_or_create_tx_record(tx_id, order_id, order_entry)
-                if tx.state == TX_COMPLETED:
-                    return Response("Checkout successful", status=200)
-                if tx.state == TX_ABORTED:
-                    tx_id = str(uuid.uuid4())
-                    await rset(_order_tx_key(order_id), tx_id)
-                    now = time.time()
-                    tx = OrderTxValue(
-                        tx_id=tx_id,
-                        order_id=order_id,
-                        user_id=order_entry.user_id,
-                        total_cost=order_entry.total_cost,
-                        items=list(order_entry.items),
-                        state=TX_STARTED,
-                        prepared_items=[],
-                        stock_prepared=False,
-                        payment_prepared=False,
-                        stock_committed=False,
-                        payment_committed=False,
-                        created_at=now,
-                        updated_at=now,
-                        error=None,
-                    )
-                    await _save_tx(tx)
+        if result["status"] == "committed":
+            return Response("Checkout successful", status=200)
 
-                items_quantities: dict[str, int] = defaultdict(int)
-                for item_id, quantity in tx.items:
-                    items_quantities[item_id] += quantity
-
-                if tx.state in (TX_STARTED, TX_PREPARING):
-                    tx.state = TX_PREPARING
-                    await _save_tx(tx)
-
-                    prepared_now = _prepared_as_dict(tx.prepared_items)
-                    for item_id, quantity in items_quantities.items():
-                        already = prepared_now.get(item_id, 0)
-                        if already >= quantity:
-                            continue
-                        try:
-                            stock_reply = await prepare_stock(tx.tx_id, item_id, quantity, tx_ts=tx.created_at)
-                        except asyncio.TimeoutError:
-                            tx.state = TX_ABORTED
-                            tx.error = f"Timeout waiting for stock prepare on item {item_id}"
-                            await _save_tx(tx)
-                            await _abort_participants(tx)
-                            abort(503, tx.error)
-                        if stock_reply.status_code != 200:
-                            tx.state = TX_ABORTED
-                            error_body = stock_reply.json()
-                            tx.error = error_body.get("error") or f"Error on item {item_id} and transaction {tx.tx_id}"
-                            await _save_tx(tx)
-                            await _abort_participants(tx)
-                            if _is_lock_error(tx.error):
-                                raise _LockContention(tx.error)
-                            abort(400, tx.error)
-                        _set_prepared_qty(tx, item_id, quantity)
-                        tx.stock_prepared = True
-                        await _save_tx(tx)
-                        print(f"Prepared stock for item_id: {item_id}, quantity: {quantity} in tx_id: {tx.tx_id}")
-
-                    if not tx.payment_prepared:
-                        try:
-                            user_reply = await prepare_payment(tx.tx_id, tx.user_id, tx.total_cost, tx_ts=tx.created_at)
-                        except asyncio.TimeoutError:
-                            tx.state = TX_ABORTED
-                            tx.error = "Timeout waiting for payment prepare"
-                            await _save_tx(tx)
-                            await _abort_participants(tx)
-                            abort(503, tx.error)
-                        if user_reply.status_code != 200:
-                            tx.state = TX_ABORTED
-                            payment_body = user_reply.json()
-                            payment_err = payment_body.get("error") if isinstance(payment_body, dict) else None
-                            if _is_lock_error(payment_err):
-                                tx.error = payment_err
-                                await _save_tx(tx)
-                                await _abort_participants(tx)
-                                raise _LockContention(payment_err)
-                            tx.error = f"User out of credit: txid: {tx.tx_id}, tx_stockprepared: {tx.stock_prepared}"
-                            await _save_tx(tx)
-                            await _abort_participants(tx)
-                            abort(400, tx.error)
-                        tx.payment_prepared = True
-                        await _save_tx(tx)
-                        print(f"Prepared payment for user_id: {tx.user_id}, amount: {tx.total_cost} in tx_id: {tx.tx_id}")
-                    tx.state = TX_PREPARED
-                    await _save_tx(tx)
-                    print(f"Transaction prepared for order_id: {order_id}, tx_id: {tx.tx_id}")
-
-                if tx.state in (TX_PREPARED, TX_COMMITTING):
-                    tx.state = TX_COMMITTING
-                    await _save_tx(tx)
-
-                    deadline = time.time() + COMMIT_RETRY_TIMEOUT_SEC
-                    while not (tx.payment_committed and tx.stock_committed):
-
-                        if not tx.payment_committed:
-                            payment_commit_reply = await commit_payment(tx.tx_id, tx_ts=tx.created_at)
-                            if payment_commit_reply.status_code == 200:
-                                tx.payment_committed = True
-                                print(f"Committed payment for user_id: {tx.user_id}, amount: {tx.total_cost} in tx_id: {tx.tx_id}")
-                            else:
-                                tx.error = "Failed to commit payment, retrying"
-                                print(f"Failed to commit payment for user_id: {tx.user_id}, amount: {tx.total_cost} in tx_id: {tx.tx_id}, retrying")
-                            await _save_tx(tx)
-
-                        if not tx.stock_committed:
-                            stock_commit_reply = await commit_stock(tx.tx_id, tx_ts=tx.created_at)
-                            if stock_commit_reply.status_code == 200:
-                                tx.stock_committed = True
-                                print(f"Committed stock for order_id: {order_id} in tx_id: {tx.tx_id}")
-                            else:
-                                tx.error = "Failed to commit stock, retrying"
-                                print(f"Failed to commit stock for order_id: {order_id} in tx_id: {tx.tx_id}, retrying")
-                            await _save_tx(tx)
-
-                        if not (tx.payment_committed and tx.stock_committed):
-                            await asyncio.sleep(COMMIT_RETRY_SLEEP_SEC)
-
-                    tx.error = None
-                    await _save_tx(tx)
-
-                    order_entry = await get_order_from_db(order_id)
-                    order_entry.paid = True
-                    await rset(order_id, msgpack.encode(order_entry))
-
-                    tx.state = TX_COMPLETED
-                    await _save_tx(tx)
-                    print(f"Transaction completed for order_id: {order_id}, tx_id: {tx.tx_id}")
-                return Response("Checkout successful", status=200)
-
-
-        except (_LockContention, WaitDieAbort) as e:
+        if result["status"] in ("lock_contention", "timeout"):
             if attempt < MAX_RETRIES:
-                print(f"[Checkout] Lock contention on attempt {attempt + 1}/{MAX_RETRIES + 1}, retrying: {e}")
+                if result.get("error") == "orchestrator restarted":
+                    # Generate a new ID if recovery scan killed the previous one
+                    new_id = str(uuid.uuid4())
+                    await rset(_order_tx_key(order_id), new_id)
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 2.0)
-            else:
-                abort(409, f"Checkout aborted after {MAX_RETRIES} retries: {e}")
+                continue
+            abort(503, result.get("error", "System busy"))
+
+        # Hard failure (e.g., out of stock)
+        abort(400, result.get("error", "Transaction aborted"))
 
 if __name__ == '__main__':
     app.run(host="0.0.0.0", port=8000, debug=True)
