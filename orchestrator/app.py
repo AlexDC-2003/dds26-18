@@ -42,10 +42,12 @@ async def startup():
     _commands_consumer = AIOKafkaConsumer(
         ORCHESTRATOR_COMMANDS_TOPIC,
         bootstrap_servers=bootstrap,
+        group_id="orchestrator-group",
         enable_auto_commit=True,
         auto_offset_reset="latest",
     )
     await _commands_consumer.start()
+    await _recover_pending_transactions()
     asyncio.create_task(_consume_commands())
 
 
@@ -309,6 +311,8 @@ async def _run_transaction(body: dict) -> dict:
     if tx.state == TX_ABORTED:
         if _is_lock_error(tx.error):
             return {"status": "lock_contention", "error": tx.error}
+        if tx.error == "__crash_abort__":
+            return {"status": "timeout", "error": "orchestrator restarted, please retry"}
         return {"status": "aborted", "error": tx.error or "previously aborted"}
 
     items_quantities: dict[str, int] = defaultdict(int)
@@ -438,6 +442,54 @@ async def _handle_command(data: dict) -> None:
         result = {"status": "aborted", "error": f"Internal error: {e}"}
     result["msg_id"] = msg_id
     await kafka_bus.publish(ORCHESTRATOR_REPLIES_TOPIC, result)
+
+
+async def _recover_pending_transactions():
+    lock_key = "orchestrator:recovery_lock"
+    acquired = await rset(lock_key, "1", nx=True, ex=60)
+    if not acquired:
+        return
+
+    print("Starting Orchestrator recovery scan...", flush=True)
+    try:
+        cursor = 0
+        while True:
+            cursor, keys = await asyncio.to_thread(db.scan, cursor, match=f"{TX_KEY_PREFIX}*", count=100)
+
+            for key in keys:
+                key_str = key.decode("utf-8")
+                raw = await rget(key_str)
+                if not raw:
+                    continue
+
+                tx = msgpack.decode(raw, type=TxRecord)
+
+                if tx.state in (TX_COMPLETED, TX_ABORTED):
+                    continue
+
+                if tx.state in (TX_STARTED, TX_PREPARING):
+                    print(f"Recovery: Rolling back stuck tx {tx.tx_id}", flush=True)
+                    tx.state = TX_ABORTED
+                    tx.error = "__crash_abort__"
+                    await _save_tx(tx)
+                    await _abort_participants(tx)
+
+                elif tx.state in (TX_PREPARED, TX_COMMITTING):
+                    print(f"Recovery: Resuming commit for tx {tx.tx_id}", flush=True)
+                    asyncio.create_task(_run_transaction({
+                        "tx_id": tx.tx_id,
+                        "order_id": tx.order_id,
+                        "user_id": tx.user_id,
+                        "total_cost": tx.total_cost,
+                        "items": tx.items,
+                        "tx_ts": tx.created_at,
+                    }))
+
+            if cursor == 0:
+                break
+    finally:
+        # Delete the lock when finished so other workers can run if needed later
+        await asyncio.to_thread(db.delete, lock_key)
 
 
 if __name__ == "__main__":
