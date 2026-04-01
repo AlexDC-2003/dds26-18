@@ -21,6 +21,7 @@ class StockKafkaInfrastructure:
         self._producer: Optional[AIOKafkaProducer] = None
         self._consumer: Optional[AIOKafkaConsumer] = None
         self._consume_task: Optional[asyncio.Task] = None
+        self._stop_evt = threading.Event()
 
         # env (match your docker-compose style; tolerate quotes)
         self._bootstrap = (os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092") or "").strip('"')
@@ -52,14 +53,20 @@ class StockKafkaInfrastructure:
             pass
 
     def stop(self) -> None:
-        """Stop consumer/producer and shut down loop."""
-        if self._loop is None:
+        """Stop consumer/producer and shut down loop safely."""
+        self._stop_evt.set()
+        if self._loop is None or not self._loop.is_running():
             return
-        fut = asyncio.run_coroutine_threadsafe(self._async_stop(), self._loop)
         try:
+            fut = asyncio.run_coroutine_threadsafe(self._async_stop(), self._loop)
             fut.result(timeout=10)
+        except (RuntimeError, TimeoutError):
+            print("Kafka stop skipped: Interpreter or Loop already shutting down.")
         finally:
-            self._loop.call_soon_threadsafe(self._loop.stop)
+            try:
+                self._loop.call_soon_threadsafe(self._loop.stop)
+            except Exception:
+                pass
 
     def _run_loop(self) -> None:
         loop = asyncio.new_event_loop()
@@ -121,18 +128,30 @@ class StockKafkaInfrastructure:
         assert self._producer is not None
 
         async for msg in self._consumer:
+            if self._stop_evt.is_set():
+                break
             command = msg.value
             asyncio.create_task(self._process_one(command))
 
     async def _process_one(self, command: Dict[str, Any]) -> None:
+        if self._stop_evt.is_set():
+            return
+
         loop = asyncio.get_running_loop()
         backoff = 0.1
         reply = None
 
         for attempt in range(1, MAX_RETRIES + 1):
+            # if loop.is_closed():
+            #     return
             try:
                 reply = await loop.run_in_executor(None, self.dispatcher, command)
                 break
+            except (RuntimeError, SyntaxError, AttributeError) as e:
+                # If the interpreter is dying, exit this function silently.
+                if "shutdown" in str(e).lower() or "none" in str(e).lower():
+                    return
+                raise e
             except (WaitDieAbort, LockTimeout) as e:
                 if attempt < MAX_RETRIES:
                     print(f"[2PL] Wait-Die retry {attempt}/{MAX_RETRIES} for msg_id={command.get('msg_id')}")

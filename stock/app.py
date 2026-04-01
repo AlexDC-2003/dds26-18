@@ -3,6 +3,7 @@ from msgspec import Struct, msgpack
 import redis
 import os
 import uuid
+import atexit
 
 from kafka_infra import StockKafkaInfrastructure
 from pc_dispatcher import stock_dispatcher, set_redis_client
@@ -30,6 +31,9 @@ lock_manager.set_redis_client(redis_client)  # shared redis into lock manager
 kafka_infra = StockKafkaInfrastructure(dispatcher=stock_dispatcher)
 
 kafka_infra.start()
+
+atexit.register(redis_client.close)
+atexit.register(kafka_infra.stop)
 @app.route("/item/create/<price>", methods=["POST"])
 def create_item(price):
     item_id = str(uuid.uuid4())
@@ -123,3 +127,8 @@ def find_all_items():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8000)
+else:
+    import logging
+    gunicorn_logger = logging.getLogger("gunicorn.error")
+    app.logger.handlers = gunicorn_logger.handlers
+    app.logger.setLevel(gunicorn_logger.level)

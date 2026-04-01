@@ -52,7 +52,7 @@ services:
       - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
       - KAFKA_ORCHESTRATOR_COMMANDS_TOPIC=orchestrator.commands
       - KAFKA_REPLIES_TOPICS=orchestrator.replies
-      - KAFKA_REQUEST_TIMEOUT_SEC=120
+      - KAFKA_REQUEST_TIMEOUT_SEC=60
     command: hypercorn -b 0.0.0.0:5000 --workers 1 app:app
     env_file:
       - env/order_redis.env
