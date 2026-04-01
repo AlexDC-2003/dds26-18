@@ -634,14 +634,18 @@ async def checkout(order_id: str):
                 if result.get("error") == "orchestrator restarted":
                     # Generate a new ID if recovery scan killed the previous one
                     new_id = str(uuid.uuid4())
-                    await rset(_order_tx_key(order_id), new_id)
+                    await rset(_order_tx_key(order_id), new_id.encode())
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 2.0)
                 continue
             abort(503, result.get("error", "System busy"))
 
-        # Hard failure (e.g., out of stock)
-        abort(400, result.get("error", "Transaction aborted"))
+        if result["status"] == "aborted":
+            new_id = str(uuid.uuid4())
+            await rset(_order_tx_key(order_id), new_id.encode())
+            abort(400, result.get("error", "Transaction aborted"))
+
+        abort(400, "Unknown error")
 
 if __name__ == '__main__':
     app.run(host="0.0.0.0", port=8000, debug=True)
