@@ -587,40 +587,48 @@ async def run_checkout_saga(cmd: dict) -> dict:
             if tx.state == TX_STARTED:
                 reserved_now = _reserved_as_dict(tx.reserved_items)
 
-                for item_id, quantity in items_quantities.items():
-                    already = reserved_now.get(item_id, 0)
-                    if already >= quantity:
-                        continue
+                to_reserve_list = [
+                    (item_id, quantity - reserved_now.get(item_id, 0))
+                    for item_id, quantity in items_quantities.items()
+                    if reserved_now.get(item_id, 0) < quantity
+                ]
 
-                    to_reserve = quantity - already
-                    try:
-                        stock_reply = await reserve_stock(tx.tx_id, item_id, to_reserve)
-                    except Exception as e:
-                        logging.warning(
-                            "[TX:RESERVE-TIMEOUT] order=%s tx=%s item=%s error=%s",
-                            order_id, tx.tx_id, item_id, e,
-                        )
-                        _add_reserved(tx, item_id, to_reserve)
+                if to_reserve_list:
+                    results = await asyncio.gather(
+                        *[reserve_stock(tx.tx_id, item_id, qty) for item_id, qty in to_reserve_list],
+                        return_exceptions=True,
+                    )
+
+                    first_failure: str | None = None
+                    is_timeout = False
+                    for (item_id, qty), result in zip(to_reserve_list, results):
+                        if isinstance(result, Exception):
+                            logging.warning(
+                                "[TX:RESERVE-TIMEOUT] order=%s tx=%s item=%s error=%s",
+                                order_id, tx.tx_id, item_id, result,
+                            )
+                            if first_failure is None:
+                                first_failure = item_id
+                                is_timeout = True
+                            _add_reserved(tx, item_id, qty)  # pessimistic: may have gone through
+                        elif result.status_code == 200:
+                            _add_reserved(tx, item_id, qty)
+                        else:
+                            if first_failure is None:
+                                first_failure = item_id
+
+                    if first_failure:
                         await rollback_stock(tx)
                         if not tx.reserved_items:
                             tx.stock_released = True
                         tx.state = TX_ABORTED
-                        tx.error = f"Reserve timed out on item_id: {item_id}"
+                        tx.error = (
+                            f"Reserve timed out on item_id: {first_failure}"
+                            if is_timeout
+                            else f"Out of stock on item_id: {first_failure}"
+                        )
                         await _save_tx(tx)
-                        return reply(503, tx.error)
-                    if stock_reply.status_code != 200:
-                        if not tx.stock_released:
-                            await rollback_stock(tx)
-                            if not tx.reserved_items:
-                                tx.stock_released = True
-                            await _save_tx(tx)
-                        tx.state = TX_ABORTED
-                        tx.error = f"Out of stock on item_id: {item_id}"
-                        await _save_tx(tx)
-                        return reply(400, tx.error)
-
-                    _add_reserved(tx, item_id, to_reserve)
-                    await _save_tx(tx)
+                        return reply(503 if is_timeout else 400, tx.error)
 
                 tx.state = TX_STOCK_RESERVED
                 await _save_tx(tx)

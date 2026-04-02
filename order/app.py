@@ -4,6 +4,7 @@ import asyncio
 import random
 import uuid
 import time
+import aiohttp
 import redis
 import requests
 from kafka_bus import KafkaBus
@@ -31,6 +32,7 @@ INTERNAL_TRANSPORT = os.environ.get("INTERNAL_TRANSPORT", "rest")
 KAFKA_TIMEOUT_SEC = float(os.environ.get("KAFKA_REQUEST_TIMEOUT_SEC", "2"))
 
 kafka_bus = KafkaBus()
+orchestrator_session: aiohttp.ClientSession | None = None
 
 async def rget(key: str):
     return await asyncio.to_thread(db.get, key)
@@ -46,13 +48,19 @@ async def http_get(url: str):
 
 @app.before_serving
 async def startup():
+    global orchestrator_session
     if INTERNAL_TRANSPORT == "kafka":
         await kafka_bus.start()
+    orchestrator_session = aiohttp.ClientSession()
 
 @app.after_serving
 async def shutdown():
+    global orchestrator_session
     if INTERNAL_TRANSPORT == "kafka":
         await kafka_bus.stop()
+    if orchestrator_session is not None:
+        await orchestrator_session.close()
+        orchestrator_session = None
     await asyncio.to_thread(db.close)
 
 
@@ -241,7 +249,16 @@ CHECKOUT_TIMEOUT_SEC = float(os.environ.get("CHECKOUT_TIMEOUT_SEC", "30"))
 
 
 async def _post_checkout(url: str, cmd: dict):
-    return requests.post(url, json=cmd, timeout=CHECKOUT_TIMEOUT_SEC)
+    if orchestrator_session is None:
+        raise RuntimeError("Orchestrator HTTP session not initialized")
+
+    timeout = aiohttp.ClientTimeout(total=CHECKOUT_TIMEOUT_SEC)
+    async with orchestrator_session.post(url, json=cmd, timeout=timeout) as reply:
+        try:
+            payload = await reply.json()
+        except aiohttp.ContentTypeError:
+            payload = {"error": await reply.text()}
+        return reply.status, payload
 
 
 @app.post('/checkout/<order_id>')
@@ -258,17 +275,14 @@ async def checkout(order_id: str):
         "items": list(order_entry.items),
     }
     try:
-        reply = await _post_checkout(f"{ORCHESTRATOR_URL}/checkout", cmd)
-    except requests.exceptions.RequestException:
+        status_code, payload = await _post_checkout(f"{ORCHESTRATOR_URL}/checkout", cmd)
+    except (aiohttp.ClientError, asyncio.TimeoutError, RuntimeError):
         abort(503, "Checkout timed out, please retry")
 
-    if reply.status_code == 200:
+    if status_code == 200:
         return Response("Checkout successful", status=200)
-    try:
-        error = reply.json().get("error", "Checkout failed")
-    except Exception:
-        error = "Checkout failed"
-    abort(reply.status_code, error)
+    error = payload.get("error", "Checkout failed") if isinstance(payload, dict) else "Checkout failed"
+    abort(status_code, error)
 
 
 if __name__ == '__main__':

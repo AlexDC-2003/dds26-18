@@ -8,4 +8,6 @@ RUN pip install -r requirements.txt
 
 COPY . .
 
-CMD ["python", "app.py"]
+EXPOSE 8000
+
+CMD ["hypercorn", "-b", "0.0.0.0:8000", "--workers", "4", "app:app"]
