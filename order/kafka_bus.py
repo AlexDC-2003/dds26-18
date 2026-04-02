@@ -57,10 +57,10 @@ class KafkaBus:
                 fut.set_exception(RuntimeError("KafkaBus stopped"))
         self._pending.clear()
 
-    async def request(self, topic: str, message: dict, timeout_sec: float) -> dict:
-        return await self._async_request(topic, message, timeout_sec)
+    async def request(self, topic: str, message: dict, timeout_sec: float, key: bytes | None = None) -> dict:
+        return await self._async_request(topic, message, timeout_sec, key=key)
 
-    async def _async_request(self, topic: str, message: dict, timeout_sec: float) -> dict:
+    async def _async_request(self, topic: str, message: dict, timeout_sec: float, key: bytes | None = None) -> dict:
         if self._producer is None:
             raise RuntimeError("Producer not started")
 
@@ -74,7 +74,7 @@ class KafkaBus:
 
         try:
             payload = json.dumps(message).encode("utf-8")
-            await self._producer.send_and_wait(topic, payload)
+            await self._producer.send_and_wait(topic, payload, key=key)
             return await asyncio.wait_for(reply_future, timeout=timeout_sec)
         finally:
             self._pending.pop(msg_id, None)

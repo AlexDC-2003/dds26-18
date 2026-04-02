@@ -349,7 +349,7 @@ async def prepare_stock(tx_id: str, item_id: str, quantity: int, *, tx_ts: float
         "type": "prepare_stock",
         "payload": {"item_id": item_id, "quantity": quantity},
     }
-    reply = await kafka_bus.request(os.environ["KAFKA_STOCK_COMMANDS_TOPIC"], cmd, timeout_sec=KAFKA_TIMEOUT_SEC)
+    reply = await kafka_bus.request(os.environ["KAFKA_STOCK_COMMANDS_TOPIC"], cmd, timeout_sec=KAFKA_TIMEOUT_SEC, key=tx_id.encode())
     return _as_response_like(reply, service="stock")
 
 async def commit_stock(tx_id: str, *, tx_ts: float):
@@ -363,7 +363,7 @@ async def commit_stock(tx_id: str, *, tx_ts: float):
         "type": "commit_stock",
         "payload": {},
     }
-    reply = await kafka_bus.request(os.environ["KAFKA_STOCK_COMMANDS_TOPIC"], cmd, timeout_sec=KAFKA_TIMEOUT_SEC)
+    reply = await kafka_bus.request(os.environ["KAFKA_STOCK_COMMANDS_TOPIC"], cmd, timeout_sec=KAFKA_TIMEOUT_SEC, key=tx_id.encode())
     return _as_response_like(reply, service="stock")
 
 async def abort_stock(tx_id: str, *, tx_ts: float):
@@ -377,7 +377,7 @@ async def abort_stock(tx_id: str, *, tx_ts: float):
         "type": "abort_stock",
         "payload": {},
     }
-    reply = await kafka_bus.request(os.environ["KAFKA_STOCK_COMMANDS_TOPIC"], cmd, timeout_sec=KAFKA_TIMEOUT_SEC)
+    reply = await kafka_bus.request(os.environ["KAFKA_STOCK_COMMANDS_TOPIC"], cmd, timeout_sec=KAFKA_TIMEOUT_SEC, key=tx_id.encode())
     return _as_response_like(reply, service="stock")
 
 async def prepare_payment(tx_id: str, user_id: str, amount: int | float, *, tx_ts: float):
@@ -391,7 +391,7 @@ async def prepare_payment(tx_id: str, user_id: str, amount: int | float, *, tx_t
         "type": "prepare_payment",
         "payload": {"user_id": user_id, "amount": amount},
     }
-    reply = await kafka_bus.request(os.environ["KAFKA_PAYMENT_COMMANDS_TOPIC"], cmd, timeout_sec=KAFKA_TIMEOUT_SEC)
+    reply = await kafka_bus.request(os.environ["KAFKA_PAYMENT_COMMANDS_TOPIC"], cmd, timeout_sec=KAFKA_TIMEOUT_SEC, key=tx_id.encode())
     return _as_response_like(reply, service="payment")
 
 async def commit_payment(tx_id: str, *, tx_ts: float):
@@ -405,7 +405,7 @@ async def commit_payment(tx_id: str, *, tx_ts: float):
         "type": "commit_payment",
         "payload": {},
     }
-    reply = await kafka_bus.request(os.environ["KAFKA_PAYMENT_COMMANDS_TOPIC"], cmd, timeout_sec=KAFKA_TIMEOUT_SEC)
+    reply = await kafka_bus.request(os.environ["KAFKA_PAYMENT_COMMANDS_TOPIC"], cmd, timeout_sec=KAFKA_TIMEOUT_SEC, key=tx_id.encode())
     return _as_response_like(reply, service="payment")
 
 async def abort_payment(tx_id: str, *, tx_ts: float):
@@ -419,7 +419,7 @@ async def abort_payment(tx_id: str, *, tx_ts: float):
         "type": "abort_payment",
         "payload": {},
     }
-    reply = await kafka_bus.request(os.environ["KAFKA_PAYMENT_COMMANDS_TOPIC"], cmd, timeout_sec=KAFKA_TIMEOUT_SEC)
+    reply = await kafka_bus.request(os.environ["KAFKA_PAYMENT_COMMANDS_TOPIC"], cmd, timeout_sec=KAFKA_TIMEOUT_SEC, key=tx_id.encode())
     return _as_response_like(reply, service="payment")
 
 

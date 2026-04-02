@@ -9,7 +9,7 @@ import redis
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
 from msgspec import Struct, msgpack
 
-from lock_manager import LockManager, Transaction, WaitDieAbort, LockTimeout
+from lock_manager import LockManager, Transaction, WaitDieAbort, LockTimeout, _decode_lock_value
 
 
 class UserValue(Struct):
@@ -303,10 +303,22 @@ class PaymentKafkaWorker:
         except (redis.exceptions.RedisError, RuntimeError) as e:
             return False, f"DB connection lost: {e}"
 
-    def _release_tx_locks(self, tx_id: str) -> None:
+    def _release_tx_locks(self, tx_id: str, user_id: str | None = None) -> None:
         txn = self._tx_contexts.pop(tx_id, None)
         if txn is not None:
             self._lock_manager.release_all(txn)
+        elif user_id:
+            # Cross-replica fallback: in-memory context missing (commit/abort
+            # arrived at a different replica than prepare). Release the Redis
+            # lock directly so it doesn't block other transactions for 30s.
+            lock_key = f"lock:user:{user_id}"
+            try:
+                raw = self._db.get(lock_key)
+                holder_tx_id, _ = _decode_lock_value(raw)
+                if holder_tx_id == tx_id:
+                    self._db.delete(lock_key)
+            except Exception:
+                pass
 
     def _prepare_payment(
         self,
@@ -412,7 +424,7 @@ class PaymentKafkaWorker:
         except (redis.exceptions.RedisError, RuntimeError) as e:
             return False, "DB connection lost: Payment DB starting up"
         finally:
-            self._release_tx_locks(tx_id)
+            self._release_tx_locks(tx_id, user_id=tx.user_id)
 
     def _abort_payment(
             self,
@@ -433,7 +445,7 @@ class PaymentKafkaWorker:
 
             tx.state = "ABORTED"
             self._db.set(tx_key, msgpack.encode(tx))
-            self._release_tx_locks(tx_id)
+            self._release_tx_locks(tx_id, user_id=tx.user_id)
             print(f"Aborted payment for tx_id: {tx_id}")
             return True, None
 
