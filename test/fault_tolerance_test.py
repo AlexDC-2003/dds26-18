@@ -41,6 +41,7 @@ CONTAINERS = [
     "dds26-18-stock-db-1",
     "dds26-18-payment-db-1",
     "dds26-18-order-db-1",
+    "dds26-18-orchestrator-1",
 ]
 KILL_INTERVAL_SEC = 3
 

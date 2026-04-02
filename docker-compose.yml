@@ -184,7 +184,7 @@ services:
     entrypoint: |
       sh -c '
       while true; do
-        for service in dds26-18-stock-service-1 dds26-18-order-service-1 dds26-18-payment-service-1 dds26-18-stock-db-1 dds26-18-order-db-1 dds26-18-payment-db-1; do
+        for service in dds26-18-stock-service-1 dds26-18-order-service-1 dds26-18-payment-service-1 dds26-18-stock-db-1 dds26-18-order-db-1 dds26-18-payment-db-1 dds26-18-orchestrator-1; do
           STATUS=$$(docker inspect $$service --format="{{.State.Status}}" 2>/dev/null)
           if [ "$$STATUS" = "exited" ] || [ "$$STATUS" = "dead" ]; then
             echo "$$service is down, restarting..."
