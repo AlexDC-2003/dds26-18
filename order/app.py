@@ -116,6 +116,8 @@ class OrderTxValue(Struct):
     error: str | None
 
 def _reply_status_code(reply: dict, *, service: str) -> int:
+    if "DB connection lost" in str(reply.get("error") or ""):
+        return 503
     # Payment worker replies with "status_code"
     if "status_code" in reply:
         return int(reply["status_code"])
@@ -153,7 +155,7 @@ async def get_order_from_db(order_id: str) -> OrderValue:
     try:
         entry: bytes | None = await rget(order_id)
     except redis.exceptions.RedisError:
-        abort(400, DB_ERROR_STR)
+        abort(503, DB_ERROR_STR)
 
     order: OrderValue | None = msgpack.decode(entry, type=OrderValue) if entry else None
     if order is None:
@@ -172,7 +174,7 @@ async def _get_or_create_tx_id(order_id: str) -> str:
     try:
         existing = await rget(_order_tx_key(order_id))
     except redis.exceptions.RedisError:
-        abort(400, DB_ERROR_STR)
+        abort(503, DB_ERROR_STR)
 
     if existing:
         return existing.decode()
@@ -186,7 +188,7 @@ async def _get_or_create_tx_id(order_id: str) -> str:
     try:
         ok = await rset(_order_tx_key(order_id), stable_tx_id, nx=True)
     except redis.exceptions.RedisError:
-        abort(400, DB_ERROR_STR)
+        abort(503, DB_ERROR_STR)
 
     if ok:
         return stable_tx_id
@@ -194,7 +196,7 @@ async def _get_or_create_tx_id(order_id: str) -> str:
     try:
         existing2 = await rget(_order_tx_key(order_id))
     except redis.exceptions.RedisError:
-        abort(400, DB_ERROR_STR)
+        abort(503, DB_ERROR_STR)
 
     return existing2.decode() if existing2 else stable_tx_id
 
@@ -203,7 +205,7 @@ async def _get_tx(tx_id: str) -> OrderTxValue | None:
     try:
         raw = await rget(_tx_key(tx_id))
     except redis.exceptions.RedisError:
-        abort(400, DB_ERROR_STR)
+        abort(503, DB_ERROR_STR)
     return msgpack.decode(raw, type=OrderTxValue) if raw else None
 
 
@@ -212,7 +214,7 @@ async def _save_tx(tx: OrderTxValue) -> None:
     try:
         await rset(_tx_key(tx.tx_id), msgpack.encode(tx))
     except redis.exceptions.RedisError:
-        abort(400, DB_ERROR_STR)
+        abort(503, DB_ERROR_STR)
 
 
 async def _get_or_create_tx_record(tx_id: str, order_id: str, order_entry: OrderValue) -> OrderTxValue:
@@ -240,7 +242,7 @@ async def _get_or_create_tx_record(tx_id: str, order_id: str, order_entry: Order
     try:
         ok = await rset(_tx_key(tx_id), msgpack.encode(tx), nx=True)
     except redis.exceptions.RedisError:
-        abort(400, DB_ERROR_STR)
+        abort(503, DB_ERROR_STR)
 
     if ok:
         return tx
@@ -414,7 +416,7 @@ async def create_order(user_id: str):
     try:
         await rset(key, value)
     except redis.exceptions.RedisError:
-        abort(400, DB_ERROR_STR)
+        abort(503, DB_ERROR_STR)
     return jsonify({'order_id': key})
 
 
@@ -440,7 +442,7 @@ async def batch_init_users(n: int, n_items: int, n_users: int, item_price: int):
     try:
         await rmset(kv_pairs)  # <-- changed
     except redis.exceptions.RedisError:
-        abort(400, DB_ERROR_STR)
+        abort(503, DB_ERROR_STR)
 
     return jsonify({"msg": "Batch init for orders successful"})
 
@@ -567,7 +569,7 @@ async def add_item(order_id: str, item_id: str, quantity: int):
     except LockTimeout as e:
         abort(503, f"Could not acquire lock in time: {e}")
     except redis.exceptions.RedisError:
-        abort(400, DB_ERROR_STR)
+        abort(503, DB_ERROR_STR)
 
     return Response(
         f"Item: {item_id} added to: {order_id} price updated to: {order_entry.total_cost}",
@@ -712,6 +714,8 @@ async def checkout(order_id: str):
                         tx.error = f"Reserve timed out on item_id: {item_id}"
                         await _save_tx(tx)
                         abort(503, tx.error)
+                    if stock_reply.status_code == 503:
+                        abort(503, f"Stock DB unavailable, please retry")
                     if stock_reply.status_code != 200:
                         if not tx.stock_released:
                             await rollback_stock(tx)
@@ -733,6 +737,9 @@ async def checkout(order_id: str):
             if tx.state == TX_STOCK_RESERVED and not tx.payment_done:
                 logging.info("[TX:CHARGING] order=%s tx=%s user=%s amount=%s", order_id, tx.tx_id, tx.user_id, tx.total_cost)
                 user_reply = await charge_user(tx.tx_id, tx.user_id, tx.total_cost, tx_ts=tx.created_at)
+                if user_reply.status_code == 503:
+                    logging.warning("[TX:CHARGE-DB-ERROR] order=%s tx=%s — transient DB error", order_id, tx.tx_id)
+                    abort(503, "Payment DB unavailable, please retry")
                 if user_reply.status_code != 200:
                     logging.warning("[TX:CHARGE-FAILED] order=%s tx=%s user=%s status=%s", order_id, tx.tx_id, tx.user_id, user_reply.status_code)
                     if not tx.stock_released:

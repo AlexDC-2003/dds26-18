@@ -172,12 +172,29 @@ class PaymentKafkaWorker:
 
     async def _process_one(self, cmd: Dict[str, Any]) -> None:
         loop = asyncio.get_running_loop()
+        backoff = 0.1
+        reply = None
+        for attempt in range(1, 6):
+            try:
+                reply = await loop.run_in_executor(None, self._handle_command, cmd)
+                if "DB connection lost" in str(reply.get("error") or ""):
+                    if attempt < 5:
+                        print(f"[Payment-Retry] DB connection lost. Retry {attempt}/5 for msg_id={cmd.get('msg_id')}")
+                        await asyncio.sleep(backoff)
+                        backoff = min(backoff * 2, 5.0)
+                        continue
+                break
+            except Exception as e:
+                print(f"Failed to process payment command: {e}")
+                reply = {"msg_id": cmd.get("msg_id"), "tx_id": cmd.get("tx_id"), "status_code": 500, "error": str(e)}
+                break
+        if reply is None:
+            reply = {"msg_id": cmd.get("msg_id"), "tx_id": cmd.get("tx_id"), "status_code": 500, "error": "no reply"}
         try:
-            reply = await loop.run_in_executor(None, self._handle_command, cmd)
             payload = json.dumps(reply).encode("utf-8")
             await self._producer.send_and_wait(self._replies_topic, payload)
         except Exception as e:
-            print(f"Failed to process/send payment reply: {e}")
+            print(f"Failed to send payment reply: {e}")
 
     def _handle_command(self, cmd: Dict[str, Any]) -> Dict[str, Any]:
         msg_id = cmd.get("msg_id")
@@ -232,6 +249,9 @@ class PaymentKafkaWorker:
             base["error"] = f"unknown command type: {typ}"
             return base
 
+        except redis.exceptions.RedisError as e:
+            base["error"] = f"DB connection lost: {e}"
+            return base
         except Exception as e:
             base["error"] = f"exception: {type(e).__name__}: {e}"
             return base
@@ -313,7 +333,7 @@ class PaymentKafkaWorker:
             return False, f"lock timeout: {e}", None
         except redis.exceptions.RedisError as e:
             logger.error("[CHARGE:ERROR] msg_id=%s tx_id=%s user=%s error=%s", msg_id, tx_id, user_id, e)
-            return False, f"DB error: {e}", None
+            return False, f"DB connection lost: {e}", None
 
     def _refund_user(
         self,
@@ -373,4 +393,4 @@ class PaymentKafkaWorker:
         except WaitDieAbort as e:
             return False, f"wait-die abort: {e}", None
         except redis.exceptions.RedisError as e:
-            return False, f"DB error: {e}", None
+            return False, f"DB connection lost: {e}", None
