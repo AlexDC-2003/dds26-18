@@ -24,13 +24,12 @@ services:
       - INTERNAL_TRANSPORT=kafka
       - KAFKA_REQUEST_TIMEOUT_SEC=15
       - KAFKA_ORDER_GROUP_ID=order-service
-      - ORCHESTRATOR_URL=http://orchestrator:8000 
-      - GATEWAY_URL=http://gateway:80
+      - ORCHESTRATOR_URL=http://orchestrator:8000
     command: hypercorn -b 0.0.0.0:5000 --workers 4 app:app
     env_file:
       - env/order_redis.env
     depends_on:
-      order-db:
+      order-db-primary:
         condition: service_started
       kafka:
         condition: service_healthy
@@ -54,19 +53,208 @@ services:
     env_file:
       - env/order_redis.env
     depends_on:
-      order-db:
+      order-db-primary:
         condition: service_started
       kafka:
         condition: service_healthy
       kafka-setup:
         condition: service_completed_successfully
 
-  order-db:
+  # ── order DB cluster ────────────────────────────────────────────────────────
+  order-db-primary:
     image: redis:7.2-bookworm
     restart: always
-    command: redis-server --requirepass redis --maxmemory 512mb --appendonly yes
+    command: >
+      redis-server
+      --requirepass redis
+      --maxmemory 512mb
+      --appendonly yes
+      --appendfsync everysec
+      --min-replicas-to-write 1
+      --min-replicas-max-lag 5
     volumes:
-      - order-db-data:/data
+      - order-db-primary-data:/data
+
+  order-db-replica-1:
+    image: redis:7.2-bookworm
+    restart: always
+    command: >
+      redis-server
+      --requirepass redis
+      --maxmemory 512mb
+      --appendonly yes
+      --appendfsync always
+      --replicaof order-db-primary 6379
+      --masterauth redis
+    volumes:
+      - order-db-replica-1-data:/data
+    depends_on:
+      - order-db-primary
+
+  order-db-replica-2:
+    image: redis:7.2-bookworm
+    restart: always
+    command: >
+      redis-server
+      --requirepass redis
+      --maxmemory 512mb
+      --appendonly yes
+      --appendfsync always
+      --replicaof order-db-primary 6379
+      --masterauth redis
+    volumes:
+      - order-db-replica-2-data:/data
+    depends_on:
+      - order-db-primary
+
+  # ── stock DB cluster ─────────────────────────────────────────────────────────
+  stock-db-primary:
+    image: redis:7.2-bookworm
+    restart: always
+    command: >
+      redis-server
+      --requirepass redis
+      --maxmemory 512mb
+      --appendonly yes
+      --appendfsync everysec
+      --min-replicas-to-write 1
+      --min-replicas-max-lag 5
+    volumes:
+      - stock-db-primary-data:/data
+
+  stock-db-replica-1:
+    image: redis:7.2-bookworm
+    restart: always
+    command: >
+      redis-server
+      --requirepass redis
+      --maxmemory 512mb
+      --appendonly yes
+      --appendfsync always
+      --replicaof stock-db-primary 6379
+      --masterauth redis
+    volumes:
+      - stock-db-replica-1-data:/data
+    depends_on:
+      - stock-db-primary
+
+  stock-db-replica-2:
+    image: redis:7.2-bookworm
+    restart: always
+    command: >
+      redis-server
+      --requirepass redis
+      --maxmemory 512mb
+      --appendonly yes
+      --appendfsync always
+      --replicaof stock-db-primary 6379
+      --masterauth redis
+    volumes:
+      - stock-db-replica-2-data:/data
+    depends_on:
+      - stock-db-primary
+
+  # ── payment DB cluster ────────────────────────────────────────────────────────
+  payment-db-primary:
+    image: redis:7.2-bookworm
+    restart: always
+    command: >
+      redis-server
+      --requirepass redis
+      --maxmemory 512mb
+      --appendonly yes
+      --appendfsync everysec
+      --min-replicas-to-write 1
+      --min-replicas-max-lag 5
+    volumes:
+      - payment-db-primary-data:/data
+
+  payment-db-replica-1:
+    image: redis:7.2-bookworm
+    restart: always
+    command: >
+      redis-server
+      --requirepass redis
+      --maxmemory 512mb
+      --appendonly yes
+      --appendfsync always
+      --replicaof payment-db-primary 6379
+      --masterauth redis
+    volumes:
+      - payment-db-replica-1-data:/data
+    depends_on:
+      - payment-db-primary
+
+  payment-db-replica-2:
+    image: redis:7.2-bookworm
+    restart: always
+    command: >
+      redis-server
+      --requirepass redis
+      --maxmemory 512mb
+      --appendonly yes
+      --appendfsync always
+      --replicaof payment-db-primary 6379
+      --masterauth redis
+    volumes:
+      - payment-db-replica-2-data:/data
+    depends_on:
+      - payment-db-primary
+
+  # ── sentinels ─────────────────────────────────────────────────────────────────
+  sentinel-1:
+    image: redis:7.2-bookworm
+    restart: always
+    volumes:
+      - ./redis/sentinel-entrypoint.sh:/entrypoint.sh:ro
+      - ./redis/reconfig.sh:/scripts/reconfig.sh:ro
+    entrypoint: ["sh", "/entrypoint.sh"]
+    depends_on:
+      - order-db-primary
+      - order-db-replica-1
+      - order-db-replica-2
+      - stock-db-primary
+      - stock-db-replica-1
+      - stock-db-replica-2
+      - payment-db-primary
+      - payment-db-replica-1
+      - payment-db-replica-2
+
+  sentinel-2:
+    image: redis:7.2-bookworm
+    restart: always
+    volumes:
+      - ./redis/sentinel-entrypoint.sh:/entrypoint.sh:ro
+      - ./redis/reconfig.sh:/scripts/reconfig.sh:ro
+    entrypoint: ["sh", "/entrypoint.sh"]
+    depends_on:
+      - order-db-primary
+      - order-db-replica-1
+      - order-db-replica-2
+      - stock-db-primary
+      - stock-db-replica-1
+      - stock-db-replica-2
+      - payment-db-primary
+      - payment-db-replica-1
+      - payment-db-replica-2
+
+  sentinel-3:
+    image: redis:7.2-bookworm
+    restart: always
+    volumes:
+      - ./redis/sentinel-entrypoint.sh:/entrypoint.sh:ro
+      - ./redis/reconfig.sh:/scripts/reconfig.sh:ro
+    entrypoint: ["sh", "/entrypoint.sh"]
+    depends_on:
+      - order-db-primary
+      - order-db-replica-1
+      - order-db-replica-2
+      - stock-db-primary
+      - stock-db-replica-1
+      - stock-db-replica-2
+      - payment-db-primary
+      - payment-db-replica-1
+      - payment-db-replica-2
 
   stock-service:
     build: ./stock
@@ -81,19 +269,12 @@ services:
     env_file:
       - env/stock_redis.env
     depends_on:
-      stock-db:
+      stock-db-primary:
         condition: service_started
       kafka:
         condition: service_healthy
       kafka-setup:
         condition: service_completed_successfully
-
-  stock-db:
-    image: redis:7.2-bookworm
-    restart: always
-    command: redis-server --requirepass redis --maxmemory 512mb --appendonly yes
-    volumes:
-      - stock-db-data:/data
 
   payment-service:
     build: ./payment
@@ -110,19 +291,12 @@ services:
     env_file:
       - env/payment_redis.env
     depends_on:
-      payment-db:
+      payment-db-primary:
         condition: service_started
       kafka:
         condition: service_healthy
       kafka-setup:
         condition: service_completed_successfully
-
-  payment-db:
-    image: redis:7.2-bookworm
-    restart: always
-    command: redis-server --requirepass redis --maxmemory 512mb --appendonly yes
-    volumes:
-      - payment-db-data:/data
 
   zookeeper:
     image: confluentinc/cp-zookeeper:7.6.1
@@ -176,7 +350,7 @@ services:
       - ./create_topics.sh:/create_topics.sh:ro
     entrypoint: [ "/bin/bash", "-c", "tr -d '\\r' < /create_topics.sh | bash" ]
     restart: "no"
-    
+
   watchdog:
     image: docker:cli
     volumes:
@@ -184,11 +358,25 @@ services:
     entrypoint: |
       sh -c '
       while true; do
-        for service in dds26-18-stock-service-1 dds26-18-order-service-1 dds26-18-payment-service-1 dds26-18-stock-db-1 dds26-18-order-db-1 dds26-18-payment-db-1 dds26-18-orchestrator-1; do
+        for service in dds26-18-order-service-1 dds26-18-stock-service-1 dds26-18-payment-service-1 dds26-18-orchestrator-1; do
           STATUS=$$(docker inspect $$service --format="{{.State.Status}}" 2>/dev/null)
           if [ "$$STATUS" = "exited" ] || [ "$$STATUS" = "dead" ]; then
             echo "$$service is down, restarting..."
             docker start $$service
+          fi
+        done
+        for db in dds26-18-order-db-primary-1 dds26-18-order-db-replica-1-1 dds26-18-order-db-replica-2-1 dds26-18-stock-db-primary-1 dds26-18-stock-db-replica-1-1 dds26-18-stock-db-replica-2-1 dds26-18-payment-db-primary-1 dds26-18-payment-db-replica-1-1 dds26-18-payment-db-replica-2-1; do
+          STATUS=$$(docker inspect $$db --format="{{.State.Status}}" 2>/dev/null)
+          if [ "$$STATUS" = "exited" ] || [ "$$STATUS" = "dead" ]; then
+            echo "$$db is down, restarting..."
+            docker start $$db
+            sleep 3
+            ROLE=$$(docker exec $$db redis-cli -a redis ROLE 2>/dev/null | head -1)
+            if [ "$$ROLE" = "master" ]; then
+              docker exec $$db redis-cli -a redis CONFIG SET appendfsync everysec 2>/dev/null || true
+            else
+              docker exec $$db redis-cli -a redis CONFIG SET appendfsync always 2>/dev/null || true
+            fi
           fi
         done
         sleep 2
@@ -197,6 +385,12 @@ services:
     restart: always
 
 volumes:
-  order-db-data:
-  stock-db-data:
-  payment-db-data:
+  order-db-primary-data:
+  order-db-replica-1-data:
+  order-db-replica-2-data:
+  stock-db-primary-data:
+  stock-db-replica-1-data:
+  stock-db-replica-2-data:
+  payment-db-primary-data:
+  payment-db-replica-1-data:
+  payment-db-replica-2-data:

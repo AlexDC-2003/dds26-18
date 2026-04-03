@@ -2,6 +2,7 @@ from flask import Flask, abort, jsonify
 from msgspec import Struct, msgpack
 import logging
 import redis
+import redis.sentinel
 import os
 import uuid
 
@@ -15,13 +16,18 @@ DB_ERROR_STR = "DB error"
 
 app = Flask("stock-service")
 
-redis_client = redis.Redis(
-    host=os.environ["REDIS_HOST"],
-    port=int(os.environ["REDIS_PORT"]),
-    password=os.environ["REDIS_PASSWORD"],
-    db=int(os.environ["REDIS_DB"]),
-    decode_responses=True
-)
+def _create_redis_client():
+    password = os.environ['REDIS_PASSWORD']
+    db_num = int(os.environ.get('REDIS_DB', '0'))
+    sentinel_hosts = os.environ.get('REDIS_SENTINEL_HOSTS', '')
+    if sentinel_hosts:
+        hosts = [(h.rsplit(':', 1)[0], int(h.rsplit(':', 1)[1])) for h in sentinel_hosts.split(',')]
+        s = redis.sentinel.Sentinel(hosts, password=password, db=db_num, decode_responses=True)
+        return s.master_for(os.environ['REDIS_MASTER_NAME'])
+    return redis.Redis(host=os.environ['REDIS_HOST'], port=int(os.environ['REDIS_PORT']),
+                       password=password, db=db_num, decode_responses=True)
+
+redis_client = _create_redis_client()
 
 class StockValue(Struct):
     stock: int

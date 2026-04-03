@@ -4,6 +4,7 @@ import os
 import time
 import uuid
 import redis
+import redis.sentinel
 
 from flask import Flask, Response, abort, jsonify
 from msgspec import Struct, msgpack
@@ -12,12 +13,18 @@ from lock_manager import LockManager, WaitDieAbort, transaction_context
 
 DB_ERROR_STR = "DB error"
 app = Flask("payment-service")
-db: redis.Redis = redis.Redis(
-    host=os.environ["REDIS_HOST"],
-    port=int(os.environ["REDIS_PORT"]),
-    password=os.environ["REDIS_PASSWORD"],
-    db=int(os.environ["REDIS_DB"]),
-)
+def _create_redis_client() -> redis.Redis:
+    password = os.environ['REDIS_PASSWORD']
+    db_num = int(os.environ.get('REDIS_DB', '0'))
+    sentinel_hosts = os.environ.get('REDIS_SENTINEL_HOSTS', '')
+    if sentinel_hosts:
+        hosts = [(h.rsplit(':', 1)[0], int(h.rsplit(':', 1)[1])) for h in sentinel_hosts.split(',')]
+        s = redis.sentinel.Sentinel(hosts, password=password, db=db_num)
+        return s.master_for(os.environ['REDIS_MASTER_NAME'])
+    return redis.Redis(host=os.environ['REDIS_HOST'], port=int(os.environ['REDIS_PORT']),
+                       password=password, db=db_num)
+
+db: redis.Redis = _create_redis_client()
 lock_manager = LockManager(db=db)
 
 def close_db_connection() -> None:
