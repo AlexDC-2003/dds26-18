@@ -314,6 +314,11 @@ async def main():
         for oid in unpaid:
             for _ in range(CHECKOUT_RETRIES):
                 sc, _ = await apost(session, f"/orders/checkout/{oid}")
+                #  try:
+                #     sc, _ = await apost(session, f"/orders/checkout/{oid}")
+                # except (asyncio.TimeoutError, aiohttp.ClientError):
+                #     await asyncio.sleep(CHECKOUT_RETRY_WAIT)
+                #     continue
                 if 200 <= sc < 300:
                     break
                 if 400 <= sc < 500:

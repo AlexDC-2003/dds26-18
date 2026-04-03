@@ -34,6 +34,7 @@ INTERNAL_TRANSPORT = os.environ.get("INTERNAL_TRANSPORT", "rest")
 KAFKA_TIMEOUT_SEC = float(os.environ.get("KAFKA_REQUEST_TIMEOUT_SEC", "15"))
 COMMIT_RETRY_TIMEOUT_SEC = float(os.environ.get("KAFKA_COMMIT_RETRY_TIMEOUT_SEC", "20"))
 COMMIT_RETRY_SLEEP_SEC = float(os.environ.get("KAFKA_COMMIT_RETRY_SLEEP_SEC", "0.05"))
+RECOVERY_STALENESS_SEC = 30  # skip transactions updated within this window (likely active on another replica)
 
 kafka_bus = KafkaBus()
 
@@ -64,6 +65,7 @@ async def _recover_pending_transactions():
 
     print("Starting Order Service recovery scan...", flush=True)
     try:
+        now = time.time()
         cursor = 0
         while True:
             cursor, keys = await asyncio.to_thread(db.scan, cursor, match=f"{TX_KEY_PREFIX}*", count=100)
@@ -73,6 +75,13 @@ async def _recover_pending_transactions():
 
                 tx = msgpack.decode(raw, type=OrderTxValue)
                 if tx.state in (TX_COMPLETED, TX_ABORTED):
+                    continue
+
+                # Skip transactions updated recently — another replica may
+                # still be actively processing them.
+                age = now - tx.updated_at
+                if age < RECOVERY_STALENESS_SEC:
+                    print(f"Recovery: Skipping tx {tx.tx_id} (updated {age:.1f}s ago, may be active)", flush=True)
                     continue
 
                 if tx.state in (TX_STARTED, TX_PREPARING):
@@ -488,6 +497,12 @@ def _is_lock_error(err: str | None) -> bool:
     return "wait-die" in low or "lock timeout" in low
 
 
+def _is_already_aborted_error(err: str | None) -> bool:
+    if not err:
+        return False
+    return "already aborted" in err.lower()
+
+
 def _prepared_as_dict(prepared_items: list[tuple[str, int]]) -> dict[str, int]:
     d: dict[str, int] = defaultdict(int)
     for item_id, qty in prepared_items:
@@ -553,6 +568,14 @@ async def _run_transaction_2pc(order_id: str, tx_id: str, order_entry: OrderValu
                         err_msg = stock_reply.json().get("error") or "Stock error"
                         if _is_lock_error(err_msg):
                             return {"status": "lock_contention", "error": err_msg}
+                        if _is_already_aborted_error(err_msg):
+                            # Recovery on another replica aborted this tx at the
+                            # participant.  Signal the caller to mint a new tx_id.
+                            tx.state = TX_ABORTED
+                            tx.error = "__crash_abort__"
+                            await _save_tx(tx)
+                            await _abort_participants(tx)
+                            return {"status": "timeout", "error": "orchestrator restarted"}
 
                         tx.state = TX_ABORTED
                         tx.error = err_msg
@@ -573,6 +596,12 @@ async def _run_transaction_2pc(order_id: str, tx_id: str, order_entry: OrderValu
                         pay_err = user_reply.json().get("error") or "Payment error"
                         if _is_lock_error(pay_err):
                             return {"status": "lock_contention", "error": pay_err}
+                        if _is_already_aborted_error(pay_err):
+                            tx.state = TX_ABORTED
+                            tx.error = "__crash_abort__"
+                            await _save_tx(tx)
+                            await _abort_participants(tx)
+                            return {"status": "timeout", "error": "orchestrator restarted"}
 
                         tx.state = TX_ABORTED
                         tx.error = pay_err
