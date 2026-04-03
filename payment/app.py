@@ -93,6 +93,8 @@ def _update_credit_2pl(user_id: str, delta: int) -> int:
         abort(409, f"Transaction aborted (wait-die): {e}")
     except LockTimeout as e:
         abort(503, f"Could not acquire lock in time: {e}")
+    except (redis.exceptions.RedisError, RuntimeError):
+        raise _DatabaseTransientError("Payment DB connection lost")
 
 
 # ---- External REST API (must remain unchanged) ----
@@ -131,14 +133,20 @@ def find_user(user_id: str):
 
 @app.post("/add_funds/<user_id>/<amount>")
 def add_credit(user_id: str, amount: int):
-    new_credit = _update_credit_2pl(user_id, int(amount))
+    try:
+        new_credit = _update_credit_2pl(user_id, int(amount))
+    except _DatabaseTransientError:
+        abort(503, "Payment DB unavailable")
     return Response(f"User: {user_id} credit updated to: {new_credit}", status=200)
 
 
 @app.post("/pay/<user_id>/<amount>")
 def remove_credit(user_id: str, amount: int):
     app.logger.debug(f"Removing {amount} credit from user: {user_id}")
-    new_credit = _update_credit_2pl(user_id, -int(amount))
+    try:
+        new_credit = _update_credit_2pl(user_id, -int(amount))
+    except _DatabaseTransientError:
+        abort(503, "Payment DB unavailable")
     return Response(f"User: {user_id} credit updated to: {new_credit}", status=200)
 
 

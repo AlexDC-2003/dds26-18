@@ -259,117 +259,117 @@ async def _run_2pc(
 ) -> dict:
     try:
         tx = await _get_or_create_tx_record(tx_id, order_id, user_id, total_cost, items)
-    except _DatabaseTransientError as e:
-        return {"status": "timeout", "error": str(e)}
 
-    if tx.state == TX_COMPLETED:
+        if tx.state == TX_COMPLETED:
+            return {"status": "committed"}
+
+        if tx.state == TX_ABORTED:
+            if tx.error == "__crash_abort__":
+                return {"status": "timeout", "error": "orchestrator restarted"}
+            if _is_lock_error(tx.error):
+                return {"status": "lock_contention", "error": tx.error}
+            return {"status": "aborted", "error": tx.error or "previously aborted"}
+
+        items_quantities: dict[str, int] = defaultdict(int)
+        for item_id, quantity in tx.items:
+            items_quantities[item_id] += quantity
+
+        # ── Prepare phase ────────────────────────────────────────────────────
+        if tx.state in (TX_STARTED, TX_PREPARING):
+            tx.state = TX_PREPARING
+            await _save_tx(tx)
+            prepared_now = _prepared_as_dict(tx.prepared_items)
+
+            for item_id, quantity in items_quantities.items():
+                if prepared_now.get(item_id, 0) >= quantity:
+                    continue
+                try:
+                    sc, err = await prepare_stock(tx.tx_id, item_id, quantity, tx_ts=tx.created_at)
+                except asyncio.TimeoutError:
+                    return {"status": "timeout"}
+
+                if sc != 200:
+                    err_msg = err or "Stock error"
+                    if _is_lock_error(err_msg):
+                        return {"status": "lock_contention", "error": err_msg}
+                    if _is_already_aborted_error(err_msg):
+                        tx.state = TX_ABORTED
+                        tx.error = "__crash_abort__"
+                        await _save_tx(tx)
+                        await _abort_participants(tx)
+                        return {"status": "timeout", "error": "orchestrator restarted"}
+
+                    tx.state = TX_ABORTED
+                    tx.error = err_msg
+                    await _save_tx(tx)
+                    await _abort_participants(tx)
+                    return {"status": "aborted", "error": tx.error}
+
+                _set_prepared_qty(tx, item_id, quantity)
+                tx.stock_prepared = True
+                await _save_tx(tx)
+
+            if not tx.payment_prepared:
+                try:
+                    sc, err = await prepare_payment(tx.tx_id, tx.user_id, tx.total_cost, tx_ts=tx.created_at)
+                except asyncio.TimeoutError:
+                    return {"status": "timeout"}
+
+                if sc != 200:
+                    pay_err = err or "Payment error"
+                    if _is_lock_error(pay_err):
+                        return {"status": "lock_contention", "error": pay_err}
+                    if _is_already_aborted_error(pay_err):
+                        tx.state = TX_ABORTED
+                        tx.error = "__crash_abort__"
+                        await _save_tx(tx)
+                        await _abort_participants(tx)
+                        return {"status": "timeout", "error": "orchestrator restarted"}
+
+                    tx.state = TX_ABORTED
+                    tx.error = pay_err
+                    await _save_tx(tx)
+                    await _abort_participants(tx)
+                    return {"status": "aborted", "error": tx.error}
+
+                tx.payment_prepared = True
+                await _save_tx(tx)
+
+            tx.state = TX_PREPARED
+            await _save_tx(tx)
+
+        # ── Commit phase ─────────────────────────────────────────────────────
+        if tx.state in (TX_PREPARED, TX_COMMITTING):
+            tx.state = TX_COMMITTING
+            await _save_tx(tx)
+
+            while not (tx.payment_committed and tx.stock_committed):
+                if not tx.payment_committed:
+                    try:
+                        sc, _ = await commit_payment(tx.tx_id, tx_ts=tx.created_at)
+                        if sc == 200:
+                            tx.payment_committed = True
+                        await _save_tx(tx)
+                    except Exception:
+                        pass
+                if not tx.stock_committed:
+                    try:
+                        sc, _ = await commit_stock(tx.tx_id, tx_ts=tx.created_at)
+                        if sc == 200:
+                            tx.stock_committed = True
+                        await _save_tx(tx)
+                    except Exception:
+                        pass
+                if not (tx.payment_committed and tx.stock_committed):
+                    await asyncio.sleep(COMMIT_RETRY_SLEEP_SEC)
+
+            tx.state = TX_COMPLETED
+            await _save_tx(tx)
+
         return {"status": "committed"}
 
-    if tx.state == TX_ABORTED:
-        if tx.error == "__crash_abort__":
-            return {"status": "timeout", "error": "orchestrator restarted"}
-        if _is_lock_error(tx.error):
-            return {"status": "lock_contention", "error": tx.error}
-        return {"status": "aborted", "error": tx.error or "previously aborted"}
-
-    items_quantities: dict[str, int] = defaultdict(int)
-    for item_id, quantity in tx.items:
-        items_quantities[item_id] += quantity
-
-    # ── Prepare phase ────────────────────────────────────────────────────
-    if tx.state in (TX_STARTED, TX_PREPARING):
-        tx.state = TX_PREPARING
-        await _save_tx(tx)
-        prepared_now = _prepared_as_dict(tx.prepared_items)
-
-        for item_id, quantity in items_quantities.items():
-            if prepared_now.get(item_id, 0) >= quantity:
-                continue
-            try:
-                sc, err = await prepare_stock(tx.tx_id, item_id, quantity, tx_ts=tx.created_at)
-            except asyncio.TimeoutError:
-                return {"status": "timeout"}
-
-            if sc != 200:
-                err_msg = err or "Stock error"
-                if _is_lock_error(err_msg):
-                    return {"status": "lock_contention", "error": err_msg}
-                if _is_already_aborted_error(err_msg):
-                    tx.state = TX_ABORTED
-                    tx.error = "__crash_abort__"
-                    await _save_tx(tx)
-                    await _abort_participants(tx)
-                    return {"status": "timeout", "error": "orchestrator restarted"}
-
-                tx.state = TX_ABORTED
-                tx.error = err_msg
-                await _save_tx(tx)
-                await _abort_participants(tx)
-                return {"status": "aborted", "error": tx.error}
-
-            _set_prepared_qty(tx, item_id, quantity)
-            tx.stock_prepared = True
-            await _save_tx(tx)
-
-        if not tx.payment_prepared:
-            try:
-                sc, err = await prepare_payment(tx.tx_id, tx.user_id, tx.total_cost, tx_ts=tx.created_at)
-            except asyncio.TimeoutError:
-                return {"status": "timeout"}
-
-            if sc != 200:
-                pay_err = err or "Payment error"
-                if _is_lock_error(pay_err):
-                    return {"status": "lock_contention", "error": pay_err}
-                if _is_already_aborted_error(pay_err):
-                    tx.state = TX_ABORTED
-                    tx.error = "__crash_abort__"
-                    await _save_tx(tx)
-                    await _abort_participants(tx)
-                    return {"status": "timeout", "error": "orchestrator restarted"}
-
-                tx.state = TX_ABORTED
-                tx.error = pay_err
-                await _save_tx(tx)
-                await _abort_participants(tx)
-                return {"status": "aborted", "error": tx.error}
-
-            tx.payment_prepared = True
-            await _save_tx(tx)
-
-        tx.state = TX_PREPARED
-        await _save_tx(tx)
-
-    # ── Commit phase ─────────────────────────────────────────────────────
-    if tx.state in (TX_PREPARED, TX_COMMITTING):
-        tx.state = TX_COMMITTING
-        await _save_tx(tx)
-
-        while not (tx.payment_committed and tx.stock_committed):
-            if not tx.payment_committed:
-                try:
-                    sc, _ = await commit_payment(tx.tx_id, tx_ts=tx.created_at)
-                    if sc == 200:
-                        tx.payment_committed = True
-                    await _save_tx(tx)
-                except Exception:
-                    pass
-            if not tx.stock_committed:
-                try:
-                    sc, _ = await commit_stock(tx.tx_id, tx_ts=tx.created_at)
-                    if sc == 200:
-                        tx.stock_committed = True
-                    await _save_tx(tx)
-                except Exception:
-                    pass
-            if not (tx.payment_committed and tx.stock_committed):
-                await asyncio.sleep(COMMIT_RETRY_SLEEP_SEC)
-
-        tx.state = TX_COMPLETED
-        await _save_tx(tx)
-
-    return {"status": "committed"}
-
+    except _DatabaseTransientError as e:
+        return {"status": "timeout", "error": str(e)}
 
 # ── Command Consumer ─────────────────────────────────────────────────────────
 

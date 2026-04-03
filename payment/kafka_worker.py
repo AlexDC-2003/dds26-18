@@ -395,16 +395,16 @@ class PaymentKafkaWorker:
         tx_ts: Optional[float] = None,
     ) -> Tuple[bool, Optional[str]]:
         tx_key = f"pay_2pc_tx:{tx_id}"
-        raw = self._db.get(tx_key)
-        if not raw:
-            return True, None
-        tx = msgpack.decode(raw, type=Payment2PCTxValue)
-        if tx.state == "COMMITTED":
-            return True, None
-        if tx.state == "ABORTED":
-            return False, "transaction already aborted"
-
         try:
+            raw = self._db.get(tx_key)
+            if not raw:
+                return True, None
+            tx = msgpack.decode(raw, type=Payment2PCTxValue)
+            if tx.state == "COMMITTED":
+                return True, None
+            if tx.state == "ABORTED":
+                return False, "transaction already aborted"
+
             raw_user = self._db.get(tx.user_id)
             if not raw_user:
                 return False, f"User: {tx.user_id} not found"
@@ -424,7 +424,10 @@ class PaymentKafkaWorker:
         except (redis.exceptions.RedisError, RuntimeError) as e:
             return False, "DB connection lost: Payment DB starting up"
         finally:
-            self._release_tx_locks(tx_id, user_id=tx.user_id)
+            try:
+                self._release_tx_locks(tx_id, user_id=tx.user_id)
+            except Exception:
+                pass
 
     def _abort_payment(
             self,
