@@ -173,12 +173,18 @@ def _reply_status_code(reply: dict, *, service: str) -> int:
 @asynccontextmanager
 async def async_2pl(resources: list[str], *, tx_id: str | None = None, ts: float | None = None):
     txn = Transaction(tx_id=tx_id, ts=ts)
-    for r in sorted(set(resources)):
-        await asyncio.to_thread(lock_manager.acquire, txn, r)
+    try:
+        for r in sorted(set(resources)):
+            await asyncio.to_thread(lock_manager.acquire, txn, r)
+    except (redis.exceptions.RedisError, OSError):
+        raise _DatabaseTransientError("Could not reach Order DB")
     try:
         yield txn
     finally:
-        await asyncio.to_thread(lock_manager.release_all, txn)
+        try:
+            await asyncio.to_thread(lock_manager.release_all, txn)
+        except (redis.exceptions.RedisError, OSError):
+            pass
 
 def _lock_resources_for_order(order_id: str) -> list[str]:
     # lock order state + “checkout started” marker
@@ -637,7 +643,10 @@ async def _run_transaction_2pc(order_id: str, tx_id: str, order_entry: OrderValu
                         await asyncio.sleep(COMMIT_RETRY_SLEEP_SEC)
 
                 order_entry.paid = True
-                await rset(order_id, msgpack.encode(order_entry))
+                try:
+                    await rset(order_id, msgpack.encode(order_entry))
+                except (redis.exceptions.RedisError, RuntimeError):
+                    raise _DatabaseTransientError("Could not reach Order DB")
                 tx.state = TX_COMPLETED
                 await _save_tx(tx)
 
@@ -666,7 +675,10 @@ async def checkout(order_id: str):
                 if attempt < MAX_RETRIES:
                     if result.get("error") == "orchestrator restarted":
                         new_id = str(uuid.uuid4())
-                        await rset(_order_tx_key(order_id), new_id.encode())
+                        try:
+                            await rset(_order_tx_key(order_id), new_id.encode())
+                        except (redis.exceptions.RedisError, RuntimeError):
+                            raise _DatabaseTransientError("Could not reach Order DB")
                     await asyncio.sleep(backoff)
                     backoff = min(backoff * 2, 2.0)
                     continue
@@ -674,7 +686,10 @@ async def checkout(order_id: str):
 
             if result["status"] == "aborted":
                 new_id = str(uuid.uuid4())
-                await rset(_order_tx_key(order_id), new_id.encode())
+                try:
+                    await rset(_order_tx_key(order_id), new_id.encode())
+                except (redis.exceptions.RedisError, RuntimeError):
+                    raise _DatabaseTransientError("Could not reach Order DB")
                 abort(400, result.get("error", "Transaction aborted"))
         except _DatabaseTransientError as e:
             if attempt < MAX_RETRIES:
