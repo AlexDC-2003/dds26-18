@@ -94,11 +94,23 @@ class OrderTxValue(Struct):
 
 
 async def rget(key: str):
-    return await asyncio.to_thread(db.get, key)
+    for attempt in range(5):
+        try:
+            return await asyncio.to_thread(db.get, key)
+        except redis.exceptions.RedisError as e:
+            if attempt == 4:
+                raise
+            await asyncio.sleep(0.2 * (2 ** attempt))
 
 
 async def rset(key: str, value: bytes, **kwargs):
-    return await asyncio.to_thread(db.set, key, value, **kwargs)
+    for attempt in range(5):
+        try:
+            return await asyncio.to_thread(db.set, key, value, **kwargs)
+        except redis.exceptions.RedisError as e:
+            if attempt == 4:
+                raise
+            await asyncio.sleep(0.2 * (2 ** attempt))
 
 
 # ---------------------------------------------------------------------------
@@ -197,6 +209,8 @@ async def _get_or_create_tx_record(
 
 
 def _reply_status_code(reply: dict, *, service: str) -> int:
+    if "DB connection lost" in str(reply.get("error") or ""):
+        return 503
     if "status_code" in reply:
         return int(reply["status_code"])
     if "ok" in reply:
@@ -613,6 +627,11 @@ async def run_checkout_saga(cmd: dict) -> dict:
                             _add_reserved(tx, item_id, qty)  # pessimistic: may have gone through
                         elif result.status_code == 200:
                             _add_reserved(tx, item_id, qty)
+                        elif result.status_code == 503:
+                            if first_failure is None:
+                                first_failure = item_id
+                                is_timeout = True
+                            _add_reserved(tx, item_id, qty)  # pessimistic: may have gone through
                         else:
                             if first_failure is None:
                                 first_failure = item_id
@@ -641,6 +660,12 @@ async def run_checkout_saga(cmd: dict) -> dict:
                 user_reply = await charge_user(
                     tx.tx_id, tx.user_id, tx.total_cost, tx_ts=tx.created_at
                 )
+                if user_reply.status_code == 503:
+                    logging.warning(
+                        "[TX:CHARGE-DB-ERROR] order=%s tx=%s user=%s — transient DB error, returning 503",
+                        order_id, tx.tx_id, tx.user_id,
+                    )
+                    return reply(503, "Payment DB unavailable, please retry")
                 if user_reply.status_code != 200:
                     logging.warning(
                         "[TX:CHARGE-FAILED] order=%s tx=%s user=%s status=%s",

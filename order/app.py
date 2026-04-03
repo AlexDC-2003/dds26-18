@@ -35,10 +35,22 @@ kafka_bus = KafkaBus()
 orchestrator_session: aiohttp.ClientSession | None = None
 
 async def rget(key: str):
-    return await asyncio.to_thread(db.get, key)
+    for attempt in range(5):
+        try:
+            return await asyncio.to_thread(db.get, key)
+        except redis.exceptions.RedisError:
+            if attempt == 4:
+                raise
+            await asyncio.sleep(0.2 * (2 ** attempt))
 
 async def rset(key: str, value: bytes, **kwargs):
-    return await asyncio.to_thread(db.set, key, value, **kwargs)
+    for attempt in range(5):
+        try:
+            return await asyncio.to_thread(db.set, key, value, **kwargs)
+        except redis.exceptions.RedisError:
+            if attempt == 4:
+                raise
+            await asyncio.sleep(0.2 * (2 ** attempt))
 
 async def rmset(mapping: dict[str, bytes]):
     return await asyncio.to_thread(db.mset, mapping)

@@ -59,16 +59,16 @@ def stock_dispatcher(command):
         log_key = f"saga:msg:{msg_id}"
     quantity = int(command["payload"].get("quantity", 0))
     tx_id = command["tx_id"]
-    # -------------------------
-    # IDEMPOTENCY CHECK
-    # -------------------------
-    
-    state = redis_client.get(log_key)
-    if state and msg_type == "release_stock":
-        logger.info("[RELEASE:IDEMPOTENT] tx=%s item=%s already released", tx_id, item_id)
-        return build_success(command, {"item_id": item_id, "released": 0})
-
     try:
+        # -------------------------
+        # IDEMPOTENCY CHECK
+        # -------------------------
+
+        state = redis_client.get(log_key)
+        if state and msg_type == "release_stock":
+            logger.info("[RELEASE:IDEMPOTENT] tx=%s item=%s already released", tx_id, item_id)
+            return build_success(command, {"item_id": item_id, "released": 0})
+
         if msg_type == "reserve_stock":
             reply = handle_reserve_stock(command)
 
@@ -77,6 +77,8 @@ def stock_dispatcher(command):
 
         else:
             reply = build_error(command, f"Unknown command type: {msg_type}")
+    except redis.exceptions.RedisError as e:
+        return build_error(command, f"DB connection lost: {e}")
     except LockDeadlockAbort as e:
         # Assumed deadlock — sleep a random back-off then re-raise so kafka_bus can retry the command
         print(f"[2PL] Deadlock abort for tx {command.get('tx_id')}: {e}")
