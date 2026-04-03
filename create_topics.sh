@@ -7,10 +7,12 @@ topics=(
   "payment.commands"
   "payment.replies"
   "order.events"
+  "orchestrator.commands"
+  "orchestrator.replies"
 )
 
 for topic in "${topics[@]}"; do
-  echo "🚀 Creating Kafka topic: $topic"
+  echo "Creating Kafka topic: $topic"
   kafka-topics --create \
     --if-not-exists  \
     --topic "$topic" \

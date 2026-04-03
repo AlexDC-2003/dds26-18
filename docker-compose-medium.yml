@@ -24,17 +24,14 @@ services:
       replicas: 3
       resources:
         limits:
-          cpus: '4'
+          cpus: '2'
     environment:
       - GATEWAY_URL=http://gateway:80
       - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
-      - KAFKA_STOCK_COMMANDS_TOPIC=stock.commands
-      - KAFKA_REPLIES_TOPICS=stock.replies,payment.replies
-      - KAFKA_PAYMENT_COMMANDS_TOPIC=payment.commands
+      - KAFKA_REPLIES_TOPICS=orchestrator.replies
+      - KAFKA_ORCHESTRATOR_COMMANDS_TOPIC=orchestrator.commands
       - INTERNAL_TRANSPORT=kafka
       - KAFKA_REQUEST_TIMEOUT_SEC=15
-      - KAFKA_COMMIT_RETRY_TIMEOUT_SEC=60
-      - KAFKA_ORDER_GROUP_ID=order-service
     command: hypercorn -b 0.0.0.0:5000 --workers 2 app:app
     env_file:
       - env/order_redis.env
@@ -62,6 +59,47 @@ services:
       timeout: 3s
       retries: 10
 
+  orchestrator-service:
+    build: ./orchestrator
+    image: orchestrator:latest
+    restart: always
+    deploy:
+      replicas: 3
+      resources:
+        limits:
+          cpus: '3'
+    environment:
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      - KAFKA_STOCK_COMMANDS_TOPIC=stock.commands
+      - KAFKA_PAYMENT_COMMANDS_TOPIC=payment.commands
+      - KAFKA_REPLIES_TOPICS=stock.replies,payment.replies
+      - KAFKA_ORCHESTRATOR_COMMANDS_TOPIC=orchestrator.commands
+      - KAFKA_ORCHESTRATOR_REPLIES_TOPIC=orchestrator.replies
+      - KAFKA_ORCHESTRATOR_GROUP_ID=orchestrator-service
+      - KAFKA_REQUEST_TIMEOUT_SEC=15
+      - KAFKA_COMMIT_RETRY_TIMEOUT_SEC=60
+    command: hypercorn -b 0.0.0.0:5000 --workers 2 app:app
+    env_file:
+      - env/orchestrator_redis.env
+    depends_on:
+      orchestrator-db:
+        condition: service_started
+      kafka:
+        condition: service_healthy
+      kafka-setup:
+        condition: service_completed_successfully
+
+  orchestrator-db:
+    image: redis:7.2-bookworm
+    restart: always
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+    command: redis-server --requirepass redis --maxmemory 1gb --appendonly yes
+    volumes:
+      - orchestrator-db-data:/data
+
   stock-service:
     build: ./stock
     image: stock:latest
@@ -70,7 +108,7 @@ services:
       replicas: 3
       resources:
         limits:
-          cpus: '4'
+          cpus: '3'
     environment:
       - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
       - KAFKA_STOCK_COMMANDS_TOPIC=stock.commands
@@ -106,7 +144,7 @@ services:
       replicas: 3
       resources:
         limits:
-          cpus: '4'
+          cpus: '3'
     environment:
       - INTERNAL_TRANSPORT=kafka
       - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
@@ -155,7 +193,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: '4'
+          cpus: '5'
     depends_on:
       - zookeeper
     ports:
@@ -217,9 +255,11 @@ services:
       while true; do
         for service in \
           dds26-18-order-service-1 dds26-18-order-service-2 dds26-18-order-service-3 \
+          dds26-18-orchestrator-service-1 dds26-18-orchestrator-service-2 dds26-18-orchestrator-service-3 \
           dds26-18-payment-service-1 dds26-18-payment-service-2 dds26-18-payment-service-3 \
           dds26-18-stock-service-1 dds26-18-stock-service-2 dds26-18-stock-service-3 \
-          dds26-18-order-db-1 dds26-18-payment-db-1 dds26-18-stock-db-1; do
+          dds26-18-order-db-1 dds26-18-orchestrator-db-1 \
+          dds26-18-payment-db-1 dds26-18-stock-db-1; do
           STATUS=$$(docker inspect $$service --format="{{.State.Status}}" 2>/dev/null)
           if [ "$$STATUS" = "exited" ] || [ "$$STATUS" = "dead" ]; then
             echo "$$service is down, restarting..."
@@ -235,3 +275,4 @@ volumes:
   order-db-data:
   stock-db-data:
   payment-db-data:
+  orchestrator-db-data:
