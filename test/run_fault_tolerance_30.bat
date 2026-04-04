@@ -19,9 +19,9 @@ for /l %%i in (1,1,30) do (
     timeout /t 5 /nobreak >nul
     echo Waiting for all services to be writable before next run...
     :waitloop
-    curl -sf http://127.0.0.1:8000/stock/find/0 >nul 2>&1
+    curl -sf -X POST http://127.0.0.1:8000/stock/batch_init/1/1/1 >nul 2>&1
     if !errorlevel! neq 0 ( timeout /t 3 /nobreak >nul & goto waitloop )
-    curl -sf http://127.0.0.1:8000/payment/find_user/0 >nul 2>&1
+    curl -sf -X POST http://127.0.0.1:8000/payment/batch_init/1/1 >nul 2>&1
     if !errorlevel! neq 0 ( timeout /t 3 /nobreak >nul & goto waitloop )
     curl -sf -X POST http://127.0.0.1:8000/orders/create/healthcheck >nul 2>&1
     if !errorlevel! neq 0 ( timeout /t 3 /nobreak >nul & goto waitloop )
