@@ -7,6 +7,7 @@ from typing import Optional, Callable, Any, Dict
 
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
 from aiokafka.errors import KafkaConnectionError
+import redis as redis_module
 
 from lock_manager import LockDeadlockAbort, MAX_RETRIES
 
@@ -136,26 +137,18 @@ class StockKafkaInfrastructure:
             try:
                 reply = await loop.run_in_executor(None, self.dispatcher, command)
                 if "DB connection lost" in str(reply.get("error") or ""):
-                    raise RuntimeError("Transient DB error")
+                    raise redis_module.exceptions.RedisError("transient: DB connection lost")
                 break
-            except RuntimeError as e:
-                if "Transient DB error" in str(e):
-                    if attempt < MAX_RETRIES:
-                        print(f"[Stock-Retry] DB connection lost. Retry {attempt}/{MAX_RETRIES} for msg_id={command.get('msg_id')}")
-                        await asyncio.sleep(backoff)
-                        backoff = min(backoff * 2, 5.0)
-                        continue
-                print(f"Error processing command: {e}")
-                reply = {"msg_id": command.get("msg_id"), "tx_id": command.get("tx_id"), "ok": False, "error": str(e)}
-                break
-            except LockDeadlockAbort as e:
+            except (redis_module.exceptions.RedisError, LockDeadlockAbort) as e:
                 if attempt < MAX_RETRIES:
-                    print(f"[2PL] Deadlock retry {attempt}/{MAX_RETRIES} for msg_id={command.get('msg_id')}")
+                    label = "DB" if isinstance(e, redis_module.exceptions.RedisError) else "2PL"
+                    print(f"[Stock-Retry:{label}] Retry {attempt}/{MAX_RETRIES} for msg_id={command.get('msg_id')}: {e}")
                     await asyncio.sleep(backoff)
                     backoff = min(backoff * 2, 5.0)
-                else:
-                    print(f"[2PL] All {MAX_RETRIES} retries exhausted for msg_id={command.get('msg_id')}")
-                    reply = {"msg_id": command.get("msg_id"), "tx_id": command.get("tx_id"), "ok": False, "error": str(e)}
+                    continue
+                print(f"[Stock] All {MAX_RETRIES} retries exhausted for msg_id={command.get('msg_id')}")
+                reply = {"msg_id": command.get("msg_id"), "tx_id": command.get("tx_id"), "ok": False, "error": str(e)}
+                break
             except Exception as e:
                 print(f"Error processing command: {e}")
                 reply = {"msg_id": command.get("msg_id"), "tx_id": command.get("tx_id"), "ok": False, "error": str(e)}

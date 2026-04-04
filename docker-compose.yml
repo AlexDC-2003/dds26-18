@@ -355,33 +355,8 @@ services:
     image: docker:cli
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-    entrypoint: |
-      sh -c '
-      while true; do
-        for service in dds26-18-order-service-1 dds26-18-stock-service-1 dds26-18-payment-service-1 dds26-18-orchestrator-1; do
-          STATUS=$$(docker inspect $$service --format="{{.State.Status}}" 2>/dev/null)
-          if [ "$$STATUS" = "exited" ] || [ "$$STATUS" = "dead" ]; then
-            echo "$$service is down, restarting..."
-            docker start $$service
-          fi
-        done
-        for db in dds26-18-order-db-primary-1 dds26-18-order-db-replica-1-1 dds26-18-order-db-replica-2-1 dds26-18-stock-db-primary-1 dds26-18-stock-db-replica-1-1 dds26-18-stock-db-replica-2-1 dds26-18-payment-db-primary-1 dds26-18-payment-db-replica-1-1 dds26-18-payment-db-replica-2-1; do
-          STATUS=$$(docker inspect $$db --format="{{.State.Status}}" 2>/dev/null)
-          if [ "$$STATUS" = "exited" ] || [ "$$STATUS" = "dead" ]; then
-            echo "$$db is down, restarting..."
-            docker start $$db
-            sleep 3
-            ROLE=$$(docker exec $$db redis-cli -a redis ROLE 2>/dev/null | head -1)
-            if [ "$$ROLE" = "master" ]; then
-              docker exec $$db redis-cli -a redis CONFIG SET appendfsync everysec 2>/dev/null || true
-            else
-              docker exec $$db redis-cli -a redis CONFIG SET appendfsync always 2>/dev/null || true
-            fi
-          fi
-        done
-        sleep 2
-      done
-      '
+      - ./watchdog.sh:/watchdog.sh:ro
+    entrypoint: ["sh", "/watchdog.sh"]
     restart: always
 
 volumes:

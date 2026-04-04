@@ -135,7 +135,7 @@ async def get_order_from_db(order_id: str) -> OrderValue:
     try:
         entry: bytes | None = await rget(order_id)
     except redis.exceptions.RedisError:
-        abort(400, DB_ERROR_STR)
+        abort(503, DB_ERROR_STR)
 
     order: OrderValue | None = msgpack.decode(entry, type=OrderValue) if entry else None
     if order is None:
@@ -152,7 +152,7 @@ async def _get_tx(tx_id: str) -> OrderTxValue | None:
     try:
         raw = await rget(_tx_key(tx_id))
     except redis.exceptions.RedisError:
-        abort(400, DB_ERROR_STR)
+        abort(503, DB_ERROR_STR)
     return msgpack.decode(raw, type=OrderTxValue) if raw else None
 
 
@@ -163,7 +163,7 @@ async def create_order(user_id: str):
     try:
         await rset(key, value)
     except redis.exceptions.RedisError:
-        abort(400, DB_ERROR_STR)
+        abort(503, DB_ERROR_STR)
     return jsonify({'order_id': key})
 
 
@@ -189,7 +189,7 @@ async def batch_init_users(n: int, n_items: int, n_users: int, item_price: int):
     try:
         await rmset(kv_pairs)
     except redis.exceptions.RedisError:
-        abort(400, DB_ERROR_STR)
+        abort(503, DB_ERROR_STR)
 
     return jsonify({"msg": "Batch init for orders successful"})
 
@@ -257,7 +257,7 @@ async def add_item(order_id: str, item_id: str, quantity: int):
     except LockTimeout as e:
         abort(503, f"Could not acquire lock in time: {e}")
     except redis.exceptions.RedisError:
-        abort(400, DB_ERROR_STR)
+        abort(503, DB_ERROR_STR)
 
     return Response(
         f"Item: {item_id} added to: {order_id} price updated to: {order_entry.total_cost}",

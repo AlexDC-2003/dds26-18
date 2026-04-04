@@ -39,11 +39,17 @@ CONTAINERS = [
     "dds26-18-payment-service-1",
     "dds26-18-order-service-1",
     "dds26-18-stock-db-primary-1",
+    "dds26-18-stock-db-replica-1-1",
+    "dds26-18-stock-db-replica-2-1",
     "dds26-18-payment-db-primary-1",
+    "dds26-18-payment-db-replica-1-1",
+    "dds26-18-payment-db-replica-2-1",
     "dds26-18-order-db-primary-1",
+    "dds26-18-order-db-replica-1-1",
+    "dds26-18-order-db-replica-2-1",
     "dds26-18-orchestrator-1",
 ]
-KILL_INTERVAL_SEC = 3
+CONTAINER_RECOVERY_TIMEOUT = 120
 
 
 # ── async HTTP helpers ────────────────────────────────────────────────────────
@@ -82,18 +88,24 @@ async def setup(session):
     sem = asyncio.Semaphore(100)
 
     async def create_item():
-        async with sem:
-            sc, j = await apost(session, f"/stock/item/create/{ITEM_PRICE}")
-            item_id = j["item_id"]
-            await apost(session, f"/stock/add/{item_id}/{ITEM_STOCK}")
-            return item_id
+        while True:
+            async with sem:
+                sc, j = await apost(session, f"/stock/item/create/{ITEM_PRICE}")
+                if sc == 200:
+                    item_id = j["item_id"]
+                    await apost(session, f"/stock/add/{item_id}/{ITEM_STOCK}")
+                    return item_id
+            await asyncio.sleep(0.5)
 
     async def create_user():
-        async with sem:
-            sc, j = await apost(session, "/payment/create_user")
-            uid = j["user_id"]
-            await apost(session, f"/payment/add_funds/{uid}/{USER_CREDIT}")
-            return uid
+        while True:
+            async with sem:
+                sc, j = await apost(session, "/payment/create_user")
+                if sc == 200:
+                    uid = j["user_id"]
+                    await apost(session, f"/payment/add_funds/{uid}/{USER_CREDIT}")
+                    return uid
+            await asyncio.sleep(0.5)
 
     import random
     print(f"  Creating {NUM_ITEMS} items...")
@@ -105,12 +117,15 @@ async def setup(session):
     print(f"  Creating {NUM_USERS * ORDERS_PER_USER} orders...")
 
     async def create_order(uid):
-        async with sem:
-            sc, j = await apost(session, f"/orders/create/{uid}")
-            oid = j["order_id"]
-            iid = random.choice(item_ids)
-            await apost(session, f"/orders/addItem/{oid}/{iid}/1")
-            return oid
+        iid = random.choice(item_ids)
+        while True:
+            async with sem:
+                sc, j = await apost(session, f"/orders/create/{uid}")
+                if sc == 200:
+                    oid = j["order_id"]
+                    await apost(session, f"/orders/addItem/{oid}/{iid}/1")
+                    return oid
+            await asyncio.sleep(0.5)
 
     all_uids = [uid for uid in user_ids for _ in range(ORDERS_PER_USER)]
     order_ids = await asyncio.gather(*[create_order(uid) for uid in all_uids])
@@ -120,12 +135,30 @@ async def setup(session):
 
 # ── fault injection (runs in a background thread) ─────────────────────────────
 
+def wait_container_running(name, timeout=CONTAINER_RECOVERY_TIMEOUT):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        result = subprocess.run(
+            ["docker", "inspect", name, "--format={{.State.Status}}"],
+            capture_output=True, text=True
+        )
+        if result.stdout.strip() == "running":
+            return True
+        time.sleep(1)
+    return False
+
+
 def fault_injector(kill_done_event):
     for name in CONTAINERS:
         result = subprocess.run(["docker", "kill", name], capture_output=True, text=True)
         status = "killed" if result.returncode == 0 else "not found"
         print(f"  [KILL] {name} ({status})")
-        time.sleep(KILL_INTERVAL_SEC)
+        if result.returncode == 0:
+            recovered = wait_container_running(name)
+            if recovered:
+                print(f"  [RECOVERED] {name}")
+            else:
+                print(f"  [TIMEOUT] {name} did not recover within 120s")
     kill_done_event.set()
     print("  [KILLS] Done.")
 
@@ -180,12 +213,16 @@ async def wait_for_recovery(session, item_ids, user_ids, timeout=120):
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
-            await aget(session, f"/stock/find/{item_ids[0]}")
-            await aget(session, f"/payment/find_user/{user_ids[0]}")
-            print("  Services healthy.")
-            return True
+            sc1, _ = await aget(session, f"/stock/find/{item_ids[0]}")
+            sc2, _ = await aget(session, f"/payment/find_user/{user_ids[0]}")
+            # probe order service writability with a throwaway order
+            sc3, _ = await apost(session, f"/orders/create/{user_ids[0]}")
+            if sc1 == 200 and sc2 == 200 and sc3 == 200:
+                print("  Services healthy.")
+                return True
         except Exception:
-            await asyncio.sleep(2)
+            pass
+        await asyncio.sleep(2)
     return False
 
 
@@ -196,19 +233,28 @@ async def consistency_check(session, item_ids, user_ids, order_ids,
     sem = asyncio.Semaphore(50)
 
     async def get_stock(iid):
-        async with sem:
-            sc, j = await aget(session, f"/stock/find/{iid}")
-            return j["stock"]
+        while True:
+            async with sem:
+                sc, j = await aget(session, f"/stock/find/{iid}")
+                if sc == 200 and isinstance(j, dict):
+                    return j["stock"]
+            await asyncio.sleep(0.5)
 
     async def get_credit(uid):
-        async with sem:
-            sc, j = await aget(session, f"/payment/find_user/{uid}")
-            return j["credit"]
+        while True:
+            async with sem:
+                sc, j = await aget(session, f"/payment/find_user/{uid}")
+                if sc == 200 and isinstance(j, dict):
+                    return j["credit"]
+            await asyncio.sleep(0.5)
 
     async def get_order(oid):
-        async with sem:
-            sc, j = await aget(session, f"/orders/find/{oid}")
-            return j
+        while True:
+            async with sem:
+                sc, j = await aget(session, f"/orders/find/{oid}")
+                if sc == 200 and isinstance(j, dict):
+                    return j
+            await asyncio.sleep(0.5)
 
     stocks  = await asyncio.gather(*[get_stock(iid) for iid in item_ids])
     credits = await asyncio.gather(*[get_credit(uid) for uid in user_ids])
@@ -263,7 +309,7 @@ async def main():
         # ── Phase 2: Load + fault injection ──────────────────────
         print(f"\n[Phase 2] Killing containers immediately + running load...")
         print(f"  {CHECKOUT_SEM} concurrent checkout slots | "
-              f"{len(CONTAINERS)} kills × {KILL_INTERVAL_SEC}s chaos\n")
+              f"{len(CONTAINERS)} kills (wait-for-recovery each) | {CONTAINER_RECOVERY_TIMEOUT}s timeout\n")
 
         kill_done = threading.Event()
         stop_event = asyncio.Event()
@@ -316,7 +362,7 @@ async def main():
         async def fetch_paid(oid):
             async with fetch_sem:
                 sc, j = await aget(session, f"/orders/find/{oid}")
-            return oid, j.get("paid", False)
+            return oid, j.get("paid", False) if isinstance(j, dict) else False
 
         paid_states = dict(await asyncio.gather(*[fetch_paid(oid) for oid in order_ids]))
         unpaid = [oid for oid, paid in paid_states.items() if not paid]
