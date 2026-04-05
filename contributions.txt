@@ -15,3 +15,10 @@ Shreyas, Student number:6513395, email: Shreyas@student.tudelft.nl. Contribution
     5) Added db replica and sentinel for failover during crashes for saga orchestrator
     6) Added scalability files for saga orchestrator 
     7) Did tons of bug-fixing for saga orchestrator
+
+Swetha Raghavendran, student number: 6393438, email: S.Raghavendran@student.tudelft.nl, contributions:
+    1) Did asynchronous event-driven communication for the order service, starting with RPC-style over Kafka and then moving to a fully asynchronous approach in the non-orchestrator saga version.
+    2) Applied saga patterns and 2-phase locking (2PL) to the order service in the non-orchestrator setup.
+    3) Made scalability configuration files for the final version.
+    4) Created the README documentation.
+    5) Testing whenever required.
