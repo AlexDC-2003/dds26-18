@@ -6,3 +6,12 @@ Matei Bordea, Student number:5755212, email: M.Bordea@student.tudelft.nl. Contri
     5) did the orchestrator for the 2-phase-commit variant together with Alex
     6) corrected the scalability files for both 2pc branches and the non orchestrator saga branch and made them consistent for all the branches
     7) did testing and experiments for all the branches when it was needed
+
+Shreyas, Student number:6513395, email: Shreyas@student.tudelft.nl. Contributions:
+    1) Added fault tolerance and recovery for saga vanilla.
+    2) Added watchdog to account for docker sometimes not restarting services
+    3) did some bug fixing for saga fixing inconsistencies, fixed bug that occurred when under high load
+    4) Worked on orchestrator that was later discarded xD
+    5) Added db replica and sentinel for failover during crashes for saga orchestrator
+    6) Added scalability files for saga orchestrator 
+    7) Did tons of bug-fixing for saga orchestrator
