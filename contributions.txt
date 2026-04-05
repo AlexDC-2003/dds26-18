@@ -27,11 +27,12 @@ Swetha Raghavendran, student number: 6393438, email: S.Raghavendran@student.tude
 
 Alexandru Cirjaliu, Student number:5814111, email: A.A.Cirjaliu-Davidescu@student.tudelft.nl. Contributions:
     1) asynchronous pseudo-event driven communication for payment service (built for saga, later reused for 2pc)
-    2) implemented payment service's saga implementation (without orchestration)
-    3) implemented payment service's Wait-Die 2-phase-locking, initially on saga implementation (without orchestration), later reused on 2pc
-    4) updated payment service's 2-phase-locking to Wait-then-Die on saga implementation (without orchestration)
-    5) bug fixing for order service on saga implementation (without orchestration)
-    6) bug fixing payment service/order service locking on 2pc implementation (without orchestration)
+    2) implemented payment service's saga vanilla implementation
+    3) implemented payment service's Wait-Die 2-phase-locking, initially on saga vanilla implementation, later reused on 2pc
+    4) updated payment service's 2-phase-locking to Wait-then-Die on saga vanilla implementation
+    5) bug fixing for order service on saga vanilla implementation
+    6) bug fixing payment service/order service locking on 2pc vanilla implementation
     7) implemented orchestrator for 2pc implementation together with Matei
     8) fixed scalability logic for 2pc implementations, both without and with orchestration
     9) tested & ran experiments across all branches (except in the final four days)
+    10) Worked on orchestrator for saga that was discarded
