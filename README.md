@@ -68,8 +68,6 @@ Files
 `docker-compose-medium.yml` 
 `docker-compose-large.yml`
 
-Scaling rules: workers ≈ 2×CPUs, Kafka partitions = replica count, replicas×CPUs = total cores consumed. Partition count is controlled by `create_topics.sh` (default) or `create_topics_large.sh` (4 partitions).
-
 ## Testing
 
 ### Unit / integration tests
