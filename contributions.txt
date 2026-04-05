@@ -36,3 +36,12 @@ Alexandru Cirjaliu, Student number:5814111, email: A.A.Cirjaliu-Davidescu@studen
     8) fixed scalability logic for 2pc implementations, both without and with orchestration
     9) tested & ran experiments across all branches (except in the final four days)
     10) Worked on orchestrator for saga that was discarded
+
+Michał Jakomulski, student number: 6568106, email: M.P.Jakomulski@student.tudelft.nl, contribiutions:
+    1) Made the conversion of the saga architecture into 2pc (non orchestrator version)
+    2) Worked on proper wait-die locking mechanisms for 2pc (non orchestrator version)
+    3) Did bug fixing for 2pc (non orchestrator version)
+    3) Implemented the first version of the deep orchestrator for saga, which was later discarded
+    4) Implemented the base version of our current implemenation of the orchestrator for saga
+    5) Did bug fixing for saga (orchestrator verison), fixed rps bottleneck
+    6) Ran tests and experiments for all the branches
