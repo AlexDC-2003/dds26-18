@@ -147,6 +147,23 @@ def handle_reserve_stock(command):
                 except redis.WatchError:
                     continue
 
+        # Post-commit confirmation: verify the write landed after potential failover
+        for attempt in range(1, 7):
+            try:
+                state = redis_client.get(log_key)
+                if state == "RESERVED":
+                    break
+                # Write didn't land — retry the full reserve
+                reply = handle_reserve_stock(command)
+                return reply
+            except redis.exceptions.RedisError as e:
+                logger.warning("[RESERVE:CONFIRM-RETRY] tx=%s item=%s attempt=%d/6 error=%s",
+                               command["tx_id"], item_id, attempt, e)
+                time.sleep(min(0.2 * 2 ** attempt, 5.0))
+        else:
+            logger.warning("[RESERVE:CONFIRMED-AFTER-FAILOVER] tx=%s item=%s qty=%s error=confirmation timed out",
+                           command["tx_id"], item_id, quantity)
+
     finally:
         release_lock(item_id, command["tx_id"])
 
@@ -176,10 +193,19 @@ def handle_release_stock(command):
                 return build_success(command, {"item_id": item_id, "released": 0})
 
         # 2) If there was no reservation (or it's missing), it's a safe no-op.
-        if not redis_client.exists(reserve_log_key):
+        reserve_state = redis_client.get(reserve_log_key)
+        if not reserve_state:
             logger.info("[RELEASE:NOOP] tx=%s item=%s — no reserve key found, skipping release",
                         command["tx_id"], item_id)
             return build_success(command, {"item_id": item_id, "released": 0})
+
+        # 3) Reserve key exists but says RELEASED — already released, backfill log and return.
+        if reserve_state == "RELEASED":
+            reply = build_success(command, {"item_id": item_id, "released": 0})
+            redis_client.set(log_key, json.dumps(reply), ex=86400)
+            logger.info("[RELEASE:BACKFILL] tx=%s item=%s — reserve already RELEASED, backfilling log",
+                        command["tx_id"], item_id)
+            return reply
 
         if not redis_client.exists(key):
             logger.warning("[RELEASE:ERROR] tx=%s item=%s — item not found", command["tx_id"], item_id)

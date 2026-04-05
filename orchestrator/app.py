@@ -646,17 +646,19 @@ async def run_checkout_saga(cmd: dict) -> dict:
                                 first_failure = item_id
 
                     if first_failure:
+                        if is_timeout:
+                            # Don't roll back — the stock worker may still be retrying.
+                            # Leave tx in TX_STARTED with partial reservations intact so
+                            # recovery or a client retry can complete or cleanly roll back.
+                            await _save_tx(tx)
+                            return reply(503, f"Reserve timed out on item_id: {first_failure}")
                         await rollback_stock(tx)
                         if not tx.reserved_items:
                             tx.stock_released = True
                         tx.state = TX_ABORTED
-                        tx.error = (
-                            f"Reserve timed out on item_id: {first_failure}"
-                            if is_timeout
-                            else f"Out of stock on item_id: {first_failure}"
-                        )
+                        tx.error = f"Out of stock on item_id: {first_failure}"
                         await _save_tx(tx)
-                        return reply(503 if is_timeout else 400, tx.error)
+                        return reply(400, tx.error)
 
                 tx.state = TX_STOCK_RESERVED
                 await _save_tx(tx)

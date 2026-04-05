@@ -1,6 +1,8 @@
 import time
 import random
-import redis
+import logging
+
+logger = logging.getLogger(__name__)
 
 # How long a lock is held before Redis auto-expires it (crashed holder safety net)
 LOCK_TTL_SECONDS: float = 10.0
@@ -16,7 +18,7 @@ RETRY_BACKOFF_MIN_SECONDS: float = 0.1
 RETRY_BACKOFF_MAX_SECONDS: float = 0.5
 
 # Max retries in kafka_infra before giving up and sending an error reply
-MAX_RETRIES: int = 5
+MAX_RETRIES: int = 10
 
 _redis_client = None
 
@@ -36,15 +38,18 @@ def acquire_lock(item_id: str, tx_id: str) -> None:
     ttl_ms = int(LOCK_TTL_SECONDS * 1000)
 
     while True:
-        # SET NX PX is a single atomic Redis command — no Lua needed
-        acquired = _redis_client.set(lock_key, tx_id, nx=True, px=ttl_ms)
-        if acquired:
-            return
+        try:
+            # SET NX PX is a single atomic Redis command — no Lua needed
+            acquired = _redis_client.set(lock_key, tx_id, nx=True, px=ttl_ms)
+            if acquired:
+                return
 
-        # Re-entrant: if we already hold the lock, no-op
-        holder = _redis_client.get(lock_key)
-        if holder == tx_id:
-            return
+            # Re-entrant: if we already hold the lock, no-op
+            holder = _redis_client.get(lock_key)
+            if holder == tx_id:
+                return
+        except Exception as e:
+            logger.warning("[LOCK:ACQUIRE-RETRY] item=%s tx=%s error=%s", item_id, tx_id, e)
 
         if time.monotonic() >= deadline:
             raise LockDeadlockAbort(
@@ -57,9 +62,12 @@ def acquire_lock(item_id: str, tx_id: str) -> None:
 
 def release_lock(item_id: str, tx_id: str) -> None:
     lock_key = f"lock:item:{item_id}"
-    holder = _redis_client.get(lock_key)
-    if holder == tx_id:
-        _redis_client.delete(lock_key)
+    try:
+        holder = _redis_client.get(lock_key)
+        if holder == tx_id:
+            _redis_client.delete(lock_key)
+    except Exception as e:
+        logger.warning("[LOCK:RELEASE-DEFERRED] item=%s tx=%s error=%s — TTL will clean up", item_id, tx_id, e)
 
 
 def random_backoff() -> float:

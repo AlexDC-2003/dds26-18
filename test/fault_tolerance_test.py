@@ -167,6 +167,9 @@ def fault_injector(kill_done_event):
 
 async def checkout_worker(session, order_id, sem, results, counters, stop_event):
     """Retry checkout until success, definitive 4xx, or stop_event."""
+    import random
+    # Spread initial requests over 2s to avoid thundering-herd on startup
+    await asyncio.sleep(random.uniform(0, 2.0))
     while not stop_event.is_set():
         async with sem:
             try:
@@ -184,10 +187,10 @@ async def checkout_worker(session, order_id, sem, results, counters, stop_event)
                         counters["fail"] += 1
                         results[order_id] = False
                         return
-                    # 5xx / unexpected → retry
+                    # 5xx / unexpected → retry with jitter to desynchronize workers
             except Exception:
                 counters["reqs"] += 1
-        await asyncio.sleep(0.2)
+        await asyncio.sleep(random.uniform(0.1, 0.5))
     results[order_id] = False
 
 
@@ -211,13 +214,18 @@ async def rps_reporter(counters, stop_event):
 async def wait_for_recovery(session, item_ids, user_ids, timeout=120):
     print("\nWaiting for all services to recover...")
     deadline = time.time() + timeout
+    probe_timeout = aiohttp.ClientTimeout(total=5)
     while time.time() < deadline:
         try:
-            sc1, _ = await aget(session, f"/stock/find/{item_ids[0]}")
-            sc2, _ = await aget(session, f"/payment/find_user/{user_ids[0]}")
-            # probe order service writability with a throwaway order
-            sc3, _ = await apost(session, f"/orders/create/{user_ids[0]}")
-            if sc1 == 200 and sc2 == 200 and sc3 == 200:
+            # Run all three probes in parallel with a short timeout each
+            results = await asyncio.gather(
+                aget(session, f"/stock/find/{item_ids[0]}"),
+                aget(session, f"/payment/find_user/{user_ids[0]}"),
+                apost(session, f"/orders/create/{user_ids[0]}"),
+                return_exceptions=True,
+            )
+            scs = [r[0] if isinstance(r, tuple) else None for r in results]
+            if all(sc == 200 for sc in scs):
                 print("  Services healthy.")
                 return True
         except Exception:

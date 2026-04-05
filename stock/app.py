@@ -51,7 +51,10 @@ def create_item(price):
 
 @app.route("/find/<item_id>", methods=["GET"])
 def find_item(item_id):
-    item = redis_client.hgetall(f"item:{item_id}")
+    try:
+        item = redis_client.hgetall(f"item:{item_id}")
+    except redis.exceptions.RedisError:
+        return jsonify({"error": "DB error"}), 503
     if not item:
         return jsonify({"error": "Item not found"}), 400
 

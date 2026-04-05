@@ -41,6 +41,8 @@ while true; do
     MASTER_CONTAINER=$(docker ps --format "{{.Names}}" | grep "$MASTER_HOST" | head -1)
     [ -z "$MASTER_CONTAINER" ] && continue
     ACTUAL_ROLE=$(docker exec $MASTER_CONTAINER redis-cli -a redis ROLE 2>/dev/null | head -1)
+    # Empty role means Redis is still starting up — skip, don't reset on false positive
+    [ -z "$ACTUAL_ROLE" ] && continue
     if [ "$ACTUAL_ROLE" != "master" ]; then
       echo "[watchdog] sentinel $master_name points to $MASTER_HOST which is not master (role=$ACTUAL_ROLE) — resetting"
       for s in $(docker ps --format "{{.Names}}" | grep sentinel); do
