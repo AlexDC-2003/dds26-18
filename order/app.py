@@ -301,11 +301,15 @@ async def checkout(order_id: str):
         "items": list(order_entry.items),
     }
 
-    try:
-        status_code, payload = await _post_checkout(f"{ORCHESTRATOR_URL}/checkout", cmd)
-    except (aiohttp.ClientError, asyncio.TimeoutError, RuntimeError) as e:
-        logging.warning("[CHECKOUT:EXCEPTION] order=%s error=%s", order_id, e)
-        abort(503, "Checkout timed out, please retry")
+    for attempt in range(5):
+        try:
+            status_code, payload = await _post_checkout(f"{ORCHESTRATOR_URL}/checkout", cmd)
+            break
+        except (aiohttp.ClientError, asyncio.TimeoutError, RuntimeError) as e:
+            if attempt == 4:
+                logging.warning("[CHECKOUT:EXCEPTION] order=%s error=%s", order_id, e)
+                abort(503, "Checkout timed out, please retry")
+            await asyncio.sleep(2 ** attempt)
 
     if status_code != 200:
         logging.warning("[CHECKOUT:NON-200] order=%s status=%s payload=%s", order_id, status_code, payload)
