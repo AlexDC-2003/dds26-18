@@ -49,7 +49,7 @@ services:
       - KAFKA_PAYMENT_COMMANDS_TOPIC=payment.commands
       - KAFKA_REQUEST_TIMEOUT_SEC=15
       - KAFKA_ORCHESTRATOR_GROUP_ID=orchestrator-group
-    command: hypercorn -b 0.0.0.0:8000 --workers 4 app:app
+    command: hypercorn -b 0.0.0.0:8000 --workers 4 --backlog 1000 app:app
     env_file:
       - env/order_redis.env
     depends_on:

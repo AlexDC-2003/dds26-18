@@ -72,7 +72,12 @@ async def startup():
     global orchestrator_session
     if INTERNAL_TRANSPORT == "kafka":
         await kafka_bus.start()
-    orchestrator_session = aiohttp.ClientSession()
+    connector = aiohttp.TCPConnector(
+        limit=0,
+        force_close=True,
+        enable_cleanup_closed=True,
+    )
+    orchestrator_session = aiohttp.ClientSession(connector=connector)
 
 @app.after_serving
 async def shutdown():
@@ -295,11 +300,15 @@ async def checkout(order_id: str):
         "total_cost": order_entry.total_cost,
         "items": list(order_entry.items),
     }
+
     try:
         status_code, payload = await _post_checkout(f"{ORCHESTRATOR_URL}/checkout", cmd)
-    except (aiohttp.ClientError, asyncio.TimeoutError, RuntimeError):
+    except (aiohttp.ClientError, asyncio.TimeoutError, RuntimeError) as e:
+        logging.warning("[CHECKOUT:EXCEPTION] order=%s error=%s", order_id, e)
         abort(503, "Checkout timed out, please retry")
 
+    if status_code != 200:
+        logging.warning("[CHECKOUT:NON-200] order=%s status=%s payload=%s", order_id, status_code, payload)
     if status_code == 200:
         return Response("Checkout successful", status=200)
     error = payload.get("error", "Checkout failed") if isinstance(payload, dict) else "Checkout failed"

@@ -519,6 +519,11 @@ async def run_checkout_saga(cmd: dict) -> dict:
     items = [tuple(i) for i in cmd["items"]]
 
     def reply(status_code: int, error: str | None = None, state: str = TX_ABORTED) -> dict:
+        if status_code != 200:
+            logging.warning(
+                "[SAGA:RESULT] order=%s status=%s state=%s error=%s",
+                order_id, status_code, state, error,
+            )
         return {
             "msg_id": msg_id,
             "order_id": order_id,
