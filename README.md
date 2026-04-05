@@ -79,14 +79,6 @@ pip install aiohttp
 python test/test_microservices.py
 ```
 
-### Concurrency tests (2PC branches only)
-
-```bash
-python test/concurrent_checkout_test.py    
-python test/concurrent_checkout_3users_test.py
-python test/concurrent_checkout_5users_test.py
-```
-
 ### Fault tolerance test
 
 ```bash
