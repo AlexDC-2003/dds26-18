@@ -1,0 +1,8 @@
+Matei Bordea, Student number:5755212, email: M.Bordea@student.tudelft.nl. Contributions:
+    1) did asynchronous pseudo-event driven communication for stock service on the non orchestrator version
+    2) did saga and 2-phase locking for the stock service on the non orchestrator version
+    3) did some bug fixing for the order service (saga and 2pc logic) on the non orchestrator version
+    4) worked on making the 2-phase commit work (did a lot of bug fixing) for the application on the non orchestrator version
+    5) did the orchestrator for the 2-phase-commit variant together with Alex
+    6) corrected the scalability files for both 2pc branches and the non orchestrator saga branch and made them consistent for all the branches
+    7) did testing and experiments for all the branches when it was needed
