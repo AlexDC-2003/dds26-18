@@ -1,67 +1,126 @@
-# Distributed Data Systems Project 
+# Distributed Data Systems Project
 
-We implement a distributed webshop using microservices for order, payment, and stock. Each service has its own Redis database and the services communicate internally through Kafka. 
+We implement a distributed webshop using microservices for order, payment, and stock. Each service has its own Redis database and the services communicate internally through Kafka.
 
-We have two versions of the checkout protocol:
+We have four variants across two protocols and two architectures:
 
-- a 2PC-based version (branch: [2pc_dev]), where the order service coordinates a distributed prepare/commit/abort protocol.
+| Branch | Protocol | Architecture |
+|---|---|---|
+| `2pc_normal_scalability` | 2PC | Order service coordinates directly |
+| `saga_high_load_fix` | Saga | Order service coordinates directly |
+| `2pc_orchestrator_scalability` | 2PC | Dedicated orchestrator service |
+| `saga_orchestrator_sentinel` | Saga | Dedicated orchestrator service |
 
-- a Saga-based version (branch: [saga_dev] and [saga_replicas]), where the order service orchestrates local actions and compensating actions.
+## 2PC
 
-Both versions use the same external API structure, but differ in how they coordinate distributed state changes during checkout.
-
-![System architecture](dds.png)
-
-## 2PC 
-Checkout is coordinated by the order service. It first asks the stock and payment services to prepare their part of the transaction, and only if all participants are ready, it sends the final commit decision. If any step fails, the transaction is aborted. This approach is designed to provide all-or-nothing distributed commit across services.
+Checkout runs as a two-phase commit. In the prepare phase, stock locks the required units and payment locks the required credit. Only once both confirm does the coordinator send commits. If any participant fails to prepare, both are aborted. The commit phase retries indefinitely — once entered it is irrevocable. State is checkpointed to Redis at each step so a crash mid-protocol can be recovered on restart.
 
 ## Saga
-The order service orchestrates checkout as a sequence of local transactions. Instead of waiting for a global commit decision, services perform their actions directly, and failures are handled through compensating actions such as releasing stock or refunding payment.
 
+Checkout is a sequence of local transactions with compensating actions on failure. Stock is reserved first, then payment is charged. If payment fails, reserved stock is released. If a crash occurs mid-saga, recovery forward-completes or compensates depending on how far the saga had progressed.
+
+![no_orch.png](no_orch.png)
+*Without orchestrator*
+## Orchestrator
+
+In the non-orchestrator branches the order service runs the full protocol itself. In the orchestrator branches a dedicated service handles all coordination — the order service forwards the checkout request over Kafka and waits for the outcome.
+
+![orch.png](orch.png)
+*With orchestrator*
 ## Project structure
 
-* `env`
-    Folder containing the Redis env variables for the docker-compose deployment
-    
-* `helm-config` 
-   Helm chart values for Redis and ingress-nginx
-        
-* `k8s`
-    Folder containing the kubernetes deployments, apps and services for the ingress, order, payment and stock services.
-    
-* `order`
-    Folder containing order application logic, transaction orchestration logic, lock management, Kafka request/reply handling, and Dockerfile. 
-    
-* `payment`
-    Folder containing the payment application logic, Kafka worker for payment commands, lock management, and Dockerfile.
+* `env` — Redis env variables for docker-compose deployment
+* `helm-config` — Helm chart values for Redis and ingress-nginx
+* `k8s` — Kubernetes deployments for ingress, order, payment, and stock
+* `orchestrator` — Orchestrator service (orchestrator branches only)
+* `order` — Order application logic, checkout coordination, lock management, Kafka request/reply
+* `payment` — Payment application logic, Kafka worker, lock management
+* `stock` — Stock application logic, Kafka consumer/dispatcher, lock management
+* `test` — Correctness, concurrency, and fault-tolerance tests
 
-* `stock`
-    Folder containing the stock application logic, Kafka consumer/dispatcher for stock commands, lock management, and Dockerfile.
+## Deployment
 
-* `test`
-    Folder containing some basic correctness tests for the entire system. 
+```bash
+# Default config
+docker compose up --build
 
-## Deployment 
+# Medium config
+docker compose -f docker-compose-medium.yml up --build -d
 
-#### docker-compose (local development)
+# Large config 
+docker compose -f docker-compose-large.yml up --build -d
 
-For local development and testing run `docker-compose up --build` in the base folder.
-This starts the gateway, all three services, their Redis instances, Kafka, ZooKeeper, topic setup, and the watchdog container.
+# Tear down
+docker compose down -v
+```
 
-***Requirements:*** You need to have docker and docker-compose installed on your machine. 
+
+**Requirements:** Docker and docker-compose must be installed.
 
 ## Fault Tolerance
 
-We include a watchdog container that monitors the service and database containers and restarts them if they crash. This is useful during fault-tolerance experiments and test scenarios where containers are intentionally killed during checkout.
+A watchdog container monitors all service and database containers and restarts them on crash. Used during fault-tolerance experiments where containers are intentionally killed mid-checkout.
 
 ## Scalability
 
-Docker compose files - docker-compose.yml , docker-compose-medium.yml (50), docker-compose-large.yml (90)
+Files 
+`docker-compose.yml`
+`docker-compose-medium.yml` 
+`docker-compose-large.yml`
 
-Run like:
-docker compose -f docker-compose-medium.yml down -v
-docker compose -f docker-compose-medium.yml up --build -d
+Scaling rules: workers ≈ 2×CPUs, Kafka partitions = replica count, replicas×CPUs = total cores consumed. Partition count is controlled by `create_topics.sh` (default) or `create_topics_large.sh` (4 partitions).
 
-For large, change partitions to 4 in create_topics.sh 
+## Testing
+
+### Unit / integration tests
+
+```bash
+pip install aiohttp
+python test/test_microservices.py
+```
+
+### Concurrency tests (2PC branches only)
+
+```bash
+python test/concurrent_checkout_test.py    
+python test/concurrent_checkout_3users_test.py
+python test/concurrent_checkout_5users_test.py
+```
+
+### Fault tolerance test
+
+```bash
+pip install aiohttp
+python test/fault_tolerance_test.py
+```
+
+Populates the system, fires concurrent checkouts, and verifies consistency at the end.
+
+## Benchmark (wdm-project-benchmark)
+
+Clone the benchmark repo:
+```bash
+git clone https://github.com/delftdata/wdm-project-benchmark
+cd wdm-project-benchmark
+pip install -r requirements.txt
+```
+
+Edit `urls.json` to point at your gateway (default is `localhost:8000`).
+
+### Consistency test
+
+```bash
+cd consistency-test
+python run_consistency_test.py
+```
+
+### Stress test
 
 
+```bash
+cd stress-test
+python init_orders.py         
+locust -f locustfile.py --host="http://localhost:8000"
+```
+
+Open `http://localhost:8089` for the Locust UI. 
