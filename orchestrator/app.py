@@ -633,14 +633,17 @@ async def run_checkout_saga(cmd: dict) -> dict:
                             if first_failure is None:
                                 first_failure = item_id
                                 is_timeout = True
-                            _add_reserved(tx, item_id, qty)  # pessimistic: may have gone through
+                            # Do NOT pessimistically add — the idempotency key on the stock
+                            # worker (saga:reserve:{tx_id}:{item_id}) deduplicates if the
+                            # first attempt succeeded. Pessimistic add causes paid orders with
+                            # no stock decremented when the first attempt never committed.
                         elif result.status_code == 200:
                             _add_reserved(tx, item_id, qty)
                         elif result.status_code == 503:
                             if first_failure is None:
                                 first_failure = item_id
                                 is_timeout = True
-                            _add_reserved(tx, item_id, qty)  # pessimistic: may have gone through
+                            # Same reasoning: don't pessimistically add on transient failure.
                         else:
                             if first_failure is None:
                                 first_failure = item_id

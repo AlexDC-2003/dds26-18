@@ -174,12 +174,13 @@ class PaymentKafkaWorker:
         loop = asyncio.get_running_loop()
         backoff = 0.1
         reply = None
-        for attempt in range(1, 6):
+        MAX_RETRIES = 10
+        for attempt in range(1, MAX_RETRIES + 1):
             try:
                 reply = await loop.run_in_executor(None, self._handle_command, cmd)
                 if "DB connection lost" in str(reply.get("error") or ""):
-                    if attempt < 5:
-                        print(f"[Payment-Retry] DB connection lost. Retry {attempt}/5 for msg_id={cmd.get('msg_id')}")
+                    if attempt < MAX_RETRIES:
+                        print(f"[Payment-Retry] DB connection lost. Retry {attempt}/{MAX_RETRIES} for msg_id={cmd.get('msg_id')}")
                         await asyncio.sleep(backoff)
                         backoff = min(backoff * 2, 5.0)
                         continue
