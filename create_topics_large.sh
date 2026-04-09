@@ -12,11 +12,11 @@ topics=(
 )
 
 for topic in "${topics[@]}"; do
-  echo "Creating Kafka topic: $topic (15 partitions)"
+  echo "Creating Kafka topic: $topic (20 partitions)"
   kafka-topics --create \
     --if-not-exists  \
     --topic "$topic" \
     --bootstrap-server kafka:9092 \
-    --partitions 15 \
+    --partitions 20 \
     --replication-factor 1
 done
