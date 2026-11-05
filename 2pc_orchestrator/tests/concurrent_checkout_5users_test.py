@@ -1,12 +1,13 @@
 """
-Simple concurrent checkout test: 2 users, 1 item with stock=1.
-Both users race to checkout the same item — exactly one should succeed.
+Simple concurrent checkout test: 5 users, 1 item, quantity=2 per user.
+All users race to checkout at the same time, and all should succeed.
 
 Usage:
     pip install aiohttp
-    python test/concurrent_checkout_test.py
+    python test/concurrent_checkout_5users_test.py
 
-Docker must be running and `docker compose -p order-processing up` must already be running.
+Run from 2pc_orchestrator/ against a running deployment:
+    docker compose -p order-processing -f compose/docker-compose.yml up -d --build
 """
 
 import asyncio
@@ -15,8 +16,12 @@ import aiohttp
 BASE_URL = "http://localhost:8000"
 TIMEOUT = aiohttp.ClientTimeout(total=20)
 
-ITEM_PRICE  = 10
+USERS_COUNT = 5
+ITEMS_PER_USER = 2
+
+ITEM_PRICE = 10
 USER_CREDIT = 100
+TOTAL_STOCK = USERS_COUNT * ITEMS_PER_USER
 
 
 async def _parse(r):
@@ -24,9 +29,11 @@ async def _parse(r):
     body = await r.json() if "json" in ct else await r.text()
     return r.status, body
 
+
 async def apost(session, path):
     async with session.post(f"{BASE_URL}{path}", timeout=TIMEOUT) as r:
         return await _parse(r)
+
 
 async def aget(session, path):
     async with session.get(f"{BASE_URL}{path}", timeout=TIMEOUT) as r:
@@ -34,59 +41,56 @@ async def aget(session, path):
 
 
 async def setup(session):
-    # Create item with stock = 1
+    # Create one item with enough stock for every user to buy quantity=2.
     sc, j = await apost(session, f"/stock/item/create/{ITEM_PRICE}")
     item_id = j["item_id"]
-    await apost(session, f"/stock/add/{item_id}/1")
-    print(f"  item_id={item_id}  stock=1  price={ITEM_PRICE}")
+    await apost(session, f"/stock/add/{item_id}/{TOTAL_STOCK}")
+    print(f"  item_id={item_id}  stock={TOTAL_STOCK}  price={ITEM_PRICE}")
 
-    # Create 2 users with enough credit
+    # Create 5 users with enough credit to buy 2 items each.
     user_ids = []
-    for i in range(2):
+    for i in range(USERS_COUNT):
         sc, j = await apost(session, "/payment/create_user")
         uid = j["user_id"]
         await apost(session, f"/payment/add_funds/{uid}/{USER_CREDIT}")
         user_ids.append(uid)
     print(f"  user_ids={user_ids}  credit={USER_CREDIT} each")
 
-    # Create one order per user, each containing the same item
+    # Create one order per user, each containing quantity=2 of the same item.
     order_ids = []
     for uid in user_ids:
         sc, j = await apost(session, f"/orders/create/{uid}")
         oid = j["order_id"]
-        await apost(session, f"/orders/addItem/{oid}/{item_id}/1")
+        await apost(session, f"/orders/addItem/{oid}/{item_id}/{ITEMS_PER_USER}")
         order_ids.append(oid)
-    print(f"  order_ids={order_ids}")
+    print(f"  order_ids={order_ids}  qty_per_order={ITEMS_PER_USER}")
 
     return item_id, user_ids, order_ids
 
 
 async def checkout_concurrently(session, order_ids):
-    """Fire both checkouts at the exact same time."""
+    """Fire all 5 checkouts at the exact same time."""
+
     async def do_checkout(oid):
         sc, body = await apost(session, f"/orders/checkout/{oid}")
         return oid, sc, body
 
-    results = await asyncio.gather(
-        do_checkout(order_ids[0]),
-        do_checkout(order_ids[1]),
-    )
+    results = await asyncio.gather(*[do_checkout(oid) for oid in order_ids])
     return results
 
 
 async def main():
-    print("=" * 50)
-    print("Concurrent Checkout Test (2 users, 1 item)")
-    print("=" * 50)
+    print("=" * 60)
+    print("Concurrent Checkout Test (5 users, 1 item, qty=2 each)")
+    print("=" * 60)
 
     async with aiohttp.ClientSession() as session:
-
         # Setup
         print("\n[Setup]")
         item_id, user_ids, order_ids = await setup(session)
-
+    
         # Concurrent checkout
-        print("\n[Test] Both users checkout concurrently...")
+        print("\n[Test] All 5 users checkout concurrently...")
         results = await checkout_concurrently(session, order_ids)
 
         success_count = 0
@@ -111,19 +115,19 @@ async def main():
             credits.append(user_info["credit"])
         print(f"  user credits = {credits}")
         total_credit = sum(credits)
-        expected_total_credit = USER_CREDIT * 2 - ITEM_PRICE  # one paid
+        expected_total_credit = USER_CREDIT * USERS_COUNT - ITEM_PRICE * TOTAL_STOCK
         print(f"  total credit = {total_credit}  (expected {expected_total_credit})")
 
         # Assertions
         print()
         passed = True
 
-        if success_count != 1:
-            print(f"FAIL — expected exactly 1 successful checkout, got {success_count}")
+        if success_count != USERS_COUNT:
+            print(f"FAIL — expected {USERS_COUNT} successful checkouts, got {success_count}")
             passed = False
 
-        if failure_count != 1:
-            print(f"FAIL — expected exactly 1 failed checkout, got {failure_count}")
+        if failure_count != 0:
+            print(f"FAIL — expected 0 failed checkouts, got {failure_count}")
             passed = False
 
         if remaining_stock != 0:
@@ -135,7 +139,7 @@ async def main():
             passed = False
 
         if passed:
-            print("PASS — exactly one user acquired the item, no stock or money lost.")
+            print("PASS — all 5 users acquired 2 items concurrently, no stock or money lost.")
 
 
 if __name__ == "__main__":

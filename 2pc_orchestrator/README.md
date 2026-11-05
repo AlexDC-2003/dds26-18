@@ -1,53 +1,61 @@
-# Distributed Data Systems Project Template
+# 2PC with an orchestrator
 
-Basic project structure with Python's Flask and Redis. 
-**You are free to use any web framework in any language and any database you like for this project.**
+The order service forwards checkout requests to a dedicated orchestrator.
+The orchestrator coordinates two-phase commit with stock and payment over Kafka.
 
-### Project structure
+## Project structure
 
-* `env`
-    Folder containing the Redis env variables for the docker-compose deployment
-    
-* `helm-config` 
-   Helm chart values for Redis and ingress-nginx
-        
-* `k8s`
-    Folder containing the kubernetes deployments, apps and services for the ingress, order, payment and stock services.
-    
-* `order`
-    Folder containing the order application logic and dockerfile. 
-    
-* `payment`
-    Folder containing the payment application logic and dockerfile. 
+- `order/`, `payment/`, `stock/`, `orchestrator/`: services and Docker build files.
+- `env/`: Redis environment files, including the orchestrator database settings.
+- `compose/`: default, medium, and large Docker Compose configurations.
+- `compose/nginx/`: gateway configurations.
+- `compose/kafka/`: Kafka topic initialization scripts.
+- `test/`: integration, concurrency, and fault-tolerance tests.
+- `test/smoke/`: checkout idempotency, insufficient stock, and insufficient credit checks.
 
-* `stock`
-    Folder containing the stock application logic and dockerfile. 
+## Deployment
 
-* `test`
-    Folder containing some basic correctness tests for the entire system. (Feel free to enhance them)
+Docker and Docker Compose are required. Run these commands from `2pc_orchestrator/`:
 
-### Deployment types:
+```bash
+# Default deployment
+docker compose -p order-processing -f compose/docker-compose.yml up -d --build
 
-#### docker-compose (local development)
+# Medium deployment
+docker compose -p order-processing -f compose/docker-compose-medium.yml up -d --build
 
-After coding the REST endpoint logic run `docker-compose up --build` in the base folder to test if your logic is correct
-(you can use the provided tests in the `\test` folder and change them as you wish). 
+# Large deployment
+docker compose -p order-processing -f compose/docker-compose-large.yml up -d --build
 
-***Requirements:*** You need to have docker and docker-compose installed on your machine. 
+# Stop the default deployment
+docker compose -p order-processing -f compose/docker-compose.yml down
+```
 
-K8s is also possible, but we do not require it as part of your submission. 
+Choose one deployment at a time. Use the same `-p order-processing` and `-f`
+options for all commands targeting it. Stop the current implementation before
+switching to another; the shared project name also shares named Redis volumes.
+Add `-v` to `down` only when you want to delete named volumes.
 
-#### minikube (local k8s cluster)
+The gateway is available at `http://localhost:8000`. Each Compose file embeds
+its watchdog command, which restarts containers killed during fault tests.
 
-This setup is for local k8s testing to see if your k8s config works before deploying to the cloud. 
-First deploy your database using helm by running the `deploy-charts-minicube.sh` file (in this example the DB is Redis 
-but you can find any database you want in https://artifacthub.io/ and adapt the script). Then adapt the k8s configuration files in the
-`\k8s` folder to mach your system and then run `kubectl apply -f .` in the k8s folder. 
+## Testing
 
-***Requirements:*** You need to have minikube (with ingress enabled) and helm installed on your machine.
+Run tests from `2pc_orchestrator/` against its running deployment:
 
-#### kubernetes cluster (managed k8s cluster in the cloud)
+```bash
+pip install requests aiohttp
+python test/test_microservices.py
 
-Similarly to the `minikube` deployment but run the `deploy-charts-cluster.sh` in the helm step to also install an ingress to the cluster. 
+bash test/smoke/check_idempotency.sh
+bash test/smoke/insufficient_stock.sh
+bash test/smoke/insufficient_credit.sh
 
-***Requirements:*** You need to have access to kubectl of a k8s cluster.
+python test/concurrent_checkout_test.py
+python test/concurrent_checkout_3users_test.py
+python test/concurrent_checkout_5users_test.py
+python test/fault_tolerance_test.py
+```
+
+Fault-tolerance tests intentionally kill containers and expect the
+`order-processing-` container name prefix.

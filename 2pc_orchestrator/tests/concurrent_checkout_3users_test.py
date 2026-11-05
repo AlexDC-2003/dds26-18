@@ -6,7 +6,8 @@ Usage:
     pip install aiohttp
     python test/concurrent_checkout_3users_test.py
 
-Docker must be running and `docker compose -p order-processing up` must already be running.
+Run from 2pc_orchestrator/ against a running deployment:
+    docker compose -p order-processing -f compose/docker-compose.yml up -d --build
 """
 
 import asyncio
