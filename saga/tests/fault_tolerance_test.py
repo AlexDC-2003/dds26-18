@@ -3,9 +3,10 @@ Fault tolerance + high-load test for the WDM microservices.
 
 Usage:
     pip install aiohttp
-    python test/fault_tolerance_test.py
+    python tests/fault_tolerance_test.py
 
-Docker must be running and `docker compose -p order-processing up` must already be running.
+Run from saga/ against a running deployment:
+    docker compose -p order-processing -f compose/docker-compose.yml up -d --build
 
 NOTE: To hit 10k checkout RPS the services need more workers.
 With default single-worker gunicorn on stock/payment the ceiling is ~100-300 checkout/s.

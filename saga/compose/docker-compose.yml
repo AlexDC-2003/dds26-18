@@ -18,7 +18,7 @@ services:
   gateway:
     image: nginx:1.25-bookworm
     volumes:
-      - ./gateway_nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/gateway_nginx.conf:/etc/nginx/nginx.conf:ro
     ports:
       - "8000:80"
     depends_on:
@@ -32,7 +32,7 @@ services:
           memory: 512m
 
   order-service:
-    build: ./order
+    build: ../order
     image: order:latest
     restart: always
     environment:
@@ -46,7 +46,7 @@ services:
       - KAFKA_ORDER_GROUP_ID=order-service
     command: hypercorn -b 0.0.0.0:5000 --workers 1 app:app
     env_file:
-      - env/order_redis.env
+      - ../env/order_redis.env
     deploy:
       resources:
         limits:
@@ -73,7 +73,7 @@ services:
           memory: 768m
 
   stock-service:
-    build: ./stock
+    build: ../stock
     image: stock:latest
     restart: always
     environment:
@@ -83,7 +83,7 @@ services:
       - KAFKA_ORDER_EVENTS_TOPIC=order.events
     command: gunicorn -b 0.0.0.0:5000 -w 1 --timeout 30 --log-level=info app:app
     env_file:
-      - env/stock_redis.env
+      - ../env/stock_redis.env
     deploy:
       resources:
         limits:
@@ -110,7 +110,7 @@ services:
           memory: 768m
 
   payment-service:
-    build: ./payment
+    build: ../payment
     image: user:latest
     restart: always
     environment:
@@ -122,7 +122,7 @@ services:
       - KAFKA_ORDER_EVENTS_TOPIC=order.events
     command: gunicorn -b 0.0.0.0:5000 -w 1 --timeout 30 --log-level=info app:app
     env_file:
-      - env/payment_redis.env
+      - ../env/payment_redis.env
     deploy:
       resources:
         limits:
@@ -212,7 +212,7 @@ services:
       kafka:
         condition: service_healthy
     volumes:
-      - ./create_topics.sh:/create_topics.sh:ro
+      - ./kafka/create_topics.sh:/create_topics.sh:ro
     entrypoint: ["/bin/bash", "-c", "tr -d '\\r' < /create_topics.sh | bash"]
     restart: "no"
 
