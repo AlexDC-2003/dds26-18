@@ -15,7 +15,7 @@ for /l %%i in (1,1,30) do (
         echo FAIL
     )
     echo Restarting sentinels to clear stale master state...
-    docker compose -f "%~dp0..\docker-compose.yml" restart sentinel-1 sentinel-2 sentinel-3 >nul 2>&1
+    docker compose -p order-processing -f "%~dp0..\docker-compose.yml" restart sentinel-1 sentinel-2 sentinel-3 >nul 2>&1
     timeout /t 5 /nobreak >nul
     echo Waiting for all services to be writable before next run...
     :waitloop

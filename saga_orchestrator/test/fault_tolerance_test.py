@@ -5,7 +5,7 @@ Usage:
     pip install aiohttp
     python test/fault_tolerance_test.py
 
-Docker must be running and `docker compose up` must already be running.
+Docker must be running and `docker compose -p order-processing up` must already be running.
 
 NOTE: To hit 10k checkout RPS the services need more workers.
 With default single-worker gunicorn on stock/payment the ceiling is ~100-300 checkout/s.
@@ -35,19 +35,19 @@ CHECKOUT_RETRIES = 15      # retry attempts for unpaid orders in Phase 3
 CHECKOUT_RETRY_WAIT = 3    # seconds between Phase 3 retries
 
 CONTAINERS = [
-    "dds26-18-stock-service-1",
-    "dds26-18-payment-service-1",
-    "dds26-18-order-service-1",
-    "dds26-18-stock-db-primary-1",
-    "dds26-18-stock-db-replica-1-1",
-    "dds26-18-stock-db-replica-2-1",
-    "dds26-18-payment-db-primary-1",
-    "dds26-18-payment-db-replica-1-1",
-    "dds26-18-payment-db-replica-2-1",
-    "dds26-18-order-db-primary-1",
-    "dds26-18-order-db-replica-1-1",
-    "dds26-18-order-db-replica-2-1",
-    "dds26-18-orchestrator-1",
+    "order-processing-stock-service-1",
+    "order-processing-payment-service-1",
+    "order-processing-order-service-1",
+    "order-processing-stock-db-primary-1",
+    "order-processing-stock-db-replica-1-1",
+    "order-processing-stock-db-replica-2-1",
+    "order-processing-payment-db-primary-1",
+    "order-processing-payment-db-replica-1-1",
+    "order-processing-payment-db-replica-2-1",
+    "order-processing-order-db-primary-1",
+    "order-processing-order-db-replica-1-1",
+    "order-processing-order-db-replica-2-1",
+    "order-processing-orchestrator-1",
 ]
 CONTAINER_RECOVERY_TIMEOUT = 120
 

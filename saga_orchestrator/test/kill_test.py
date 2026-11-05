@@ -83,9 +83,9 @@ async def setup(session):
 
 async def run_load(session, order_ids):
     print(f"\nFiring checkouts for {LOAD_DURATION_SEC}s — kill services now!")
-    print("  docker kill dds26-18-stock-service-1  (then wait for recovery)")
-    print("  docker kill dds26-18-payment-service-1")
-    print("  docker kill dds26-18-order-service-1\n")
+    print("  docker kill order-processing-stock-service-1  (then wait for recovery)")
+    print("  docker kill order-processing-payment-service-1")
+    print("  docker kill order-processing-order-service-1\n")
 
     deadline = time.time() + LOAD_DURATION_SEC
     ok = fail = errors = 0
