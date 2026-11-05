@@ -45,16 +45,16 @@ Run tests from `2pc_orchestrator/` against its running deployment:
 
 ```bash
 pip install requests aiohttp
-python test/test_microservices.py
+python tests/test_microservices.py
 
-bash test/smoke/check_idempotency.sh
-bash test/smoke/insufficient_stock.sh
-bash test/smoke/insufficient_credit.sh
+bash tests/smoke/check_idempotency.sh
+bash tests/smoke/insufficient_stock.sh
+bash tests/smoke/insufficient_credit.sh
 
-python test/concurrent_checkout_test.py
-python test/concurrent_checkout_3users_test.py
-python test/concurrent_checkout_5users_test.py
-python test/fault_tolerance_test.py
+python tests/concurrent_checkout_test.py
+python tests/concurrent_checkout_3users_test.py
+python tests/concurrent_checkout_5users_test.py
+python tests/fault_tolerance_test.py
 ```
 
 Fault-tolerance tests intentionally kill containers and expect the
