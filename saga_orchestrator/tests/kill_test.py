@@ -61,9 +61,16 @@ async def setup(session):
         await post(session, f"/stock/add/{iid}/{ITEM_STOCK}")
         item_ids.append(iid)
 
+    # Limit the setup burst against the payment service.
+    sem = asyncio.Semaphore(25)
+
+    async def create_user():
+        async with sem:
+            return await post(session, "/payment/create_user")
+
     tasks = []
     for _ in range(NUM_USERS):
-        tasks.append(post(session, "/payment/create_user"))
+        tasks.append(create_user())
     results = await asyncio.gather(*tasks)
     for sc, j in results:
         uid = j["user_id"]

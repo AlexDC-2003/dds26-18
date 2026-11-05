@@ -4,7 +4,7 @@ services:
   gateway:
     image: nginx:1.25-bookworm
     volumes:
-      - ./gateway_nginx_large.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/gateway_nginx_large.conf:/etc/nginx/nginx.conf:ro
     ports:
       - "8000:80"
     deploy:
@@ -17,7 +17,7 @@ services:
       - payment-service
 
   order-service:
-    build: ./order
+    build: ../order
     image: order:latest
     restart: always
     deploy:
@@ -36,7 +36,7 @@ services:
       - ORCHESTRATOR_URL=http://orchestrator:8000
     command: hypercorn -b 0.0.0.0:5000 --workers 3 app:app
     env_file:
-      - env/order_redis.env
+      - ../env/order_redis.env
     depends_on:
       order-db-primary:
         condition: service_started
@@ -46,7 +46,7 @@ services:
         condition: service_completed_successfully
 
   orchestrator:
-    build: ./orchestrator
+    build: ../orchestrator
     image: orchestrator:latest
     restart: always
     deploy:
@@ -65,7 +65,7 @@ services:
       - KAFKA_ORCHESTRATOR_GROUP_ID=orchestrator-group
     command: hypercorn -b 0.0.0.0:8000 --workers 4 app:app
     env_file:
-      - env/order_redis.env
+      - ../env/order_redis.env
     depends_on:
       order-db-primary:
         condition: service_started
@@ -260,8 +260,8 @@ services:
         limits:
           cpus: '0.5'
     volumes:
-      - ./redis/sentinel-entrypoint.sh:/entrypoint.sh:ro
-      - ./redis/reconfig.sh:/scripts/reconfig.sh:ro
+      - ../redis/sentinel-entrypoint.sh:/entrypoint.sh:ro
+      - ../redis/reconfig.sh:/scripts/reconfig.sh:ro
     entrypoint: ["sh", "/entrypoint.sh"]
     depends_on:
       - order-db-primary
@@ -282,8 +282,8 @@ services:
         limits:
           cpus: '0.5'
     volumes:
-      - ./redis/sentinel-entrypoint.sh:/entrypoint.sh:ro
-      - ./redis/reconfig.sh:/scripts/reconfig.sh:ro
+      - ../redis/sentinel-entrypoint.sh:/entrypoint.sh:ro
+      - ../redis/reconfig.sh:/scripts/reconfig.sh:ro
     entrypoint: ["sh", "/entrypoint.sh"]
     depends_on:
       - order-db-primary
@@ -304,8 +304,8 @@ services:
         limits:
           cpus: '0.5'
     volumes:
-      - ./redis/sentinel-entrypoint.sh:/entrypoint.sh:ro
-      - ./redis/reconfig.sh:/scripts/reconfig.sh:ro
+      - ../redis/sentinel-entrypoint.sh:/entrypoint.sh:ro
+      - ../redis/reconfig.sh:/scripts/reconfig.sh:ro
     entrypoint: ["sh", "/entrypoint.sh"]
     depends_on:
       - order-db-primary
@@ -319,7 +319,7 @@ services:
       - payment-db-replica-2
 
   stock-service:
-    build: ./stock
+    build: ../stock
     image: stock:latest
     restart: always
     deploy:
@@ -334,7 +334,7 @@ services:
       - KAFKA_ORDER_EVENTS_TOPIC=order.events
     command: gunicorn -b 0.0.0.0:5000 -w 4 --timeout 30 --log-level=info app:app
     env_file:
-      - env/stock_redis.env
+      - ../env/stock_redis.env
     depends_on:
       stock-db-primary:
         condition: service_started
@@ -344,7 +344,7 @@ services:
         condition: service_completed_successfully
 
   payment-service:
-    build: ./payment
+    build: ../payment
     image: user:latest
     restart: always
     deploy:
@@ -361,7 +361,7 @@ services:
       - KAFKA_ORDER_EVENTS_TOPIC=order.events
     command: gunicorn -b 0.0.0.0:5000 -w 4 --timeout 30 --log-level=info app:app
     env_file:
-      - env/payment_redis.env
+      - ../env/payment_redis.env
     depends_on:
       payment-db-primary:
         condition: service_started
@@ -434,7 +434,7 @@ services:
       kafka:
         condition: service_healthy
     volumes:
-      - ./create_topics_large.sh:/create_topics.sh:ro
+      - ./kafka/create_topics_large.sh:/create_topics.sh:ro
     entrypoint: [ "/bin/bash", "-c", "tr -d '\\r' < /create_topics.sh | bash" ]
     restart: "no"
 
@@ -446,7 +446,7 @@ services:
           cpus: '0.5'
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-      - ./watchdog.sh:/watchdog.sh:ro
+      - ../watchdog.sh:/watchdog.sh:ro
     entrypoint: ["sh", "/watchdog.sh"]
     restart: always
 
