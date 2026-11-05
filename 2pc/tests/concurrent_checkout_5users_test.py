@@ -4,9 +4,10 @@ All users race to checkout at the same time, and all should succeed.
 
 Usage:
     pip install aiohttp
-    python test/concurrent_checkout_5users_test.py
+    python tests/concurrent_checkout_5users_test.py
 
-Docker must be running and `docker compose -p order-processing up` must already be running.
+Run from 2pc/ against a running deployment:
+    docker compose -p order-processing -f compose/docker-compose.yml up -d --build
 """
 
 import asyncio

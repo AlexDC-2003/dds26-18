@@ -4,27 +4,27 @@ services:
   gateway:
     image: nginx:1.25-bookworm
     volumes:
-      - ./gateway_nginx_large.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/gateway_nginx_medium.conf:/etc/nginx/nginx.conf:ro
     ports:
       - "8000:80"
     deploy:
       resources:
         limits:
-          cpus: '3'
+          cpus: '2'
     depends_on:
       - order-service
       - stock-service
       - payment-service
 
   order-service:
-    build: ./order
+    build: ../order
     image: order:latest
     restart: always
     deploy:
-      replicas: 5
+      replicas: 3
       resources:
         limits:
-          cpus: '5'
+          cpus: '4'
     environment:
       - GATEWAY_URL=http://gateway:80
       - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
@@ -35,9 +35,9 @@ services:
       - KAFKA_REQUEST_TIMEOUT_SEC=15
       - KAFKA_COMMIT_RETRY_TIMEOUT_SEC=60
       - KAFKA_ORDER_GROUP_ID=order-service
-    command: hypercorn -b 0.0.0.0:5000 --workers 3 app:app
+    command: hypercorn -b 0.0.0.0:5000 --workers 2 app:app
     env_file:
-      - env/order_redis.env
+      - ../env/order_redis.env
     depends_on:
       order-db:
         condition: service_healthy
@@ -52,8 +52,8 @@ services:
     deploy:
       resources:
         limits:
-          cpus: '4'
-    command: redis-server --requirepass redis --maxmemory 2gb --appendonly yes
+          cpus: '2'
+    command: redis-server --requirepass redis --maxmemory 1gb --appendonly yes
     volumes:
       - order-db-data:/data
     healthcheck:
@@ -63,11 +63,11 @@ services:
       retries: 10
 
   stock-service:
-    build: ./stock
+    build: ../stock
     image: stock:latest
     restart: always
     deploy:
-      replicas: 5
+      replicas: 3
       resources:
         limits:
           cpus: '4'
@@ -76,9 +76,9 @@ services:
       - KAFKA_STOCK_COMMANDS_TOPIC=stock.commands
       - KAFKA_STOCK_REPLIES_TOPIC=stock.replies
       - KAFKA_ORDER_EVENTS_TOPIC=order.events
-    command: gunicorn -b 0.0.0.0:5000 -w 3 --timeout 30 --log-level=info app:app
+    command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
     env_file:
-      - env/stock_redis.env
+      - ../env/stock_redis.env
     depends_on:
       stock-db:
         condition: service_started
@@ -93,17 +93,17 @@ services:
     deploy:
       resources:
         limits:
-          cpus: '3'
-    command: redis-server --requirepass redis --maxmemory 2gb --appendonly yes
+          cpus: '2'
+    command: redis-server --requirepass redis --maxmemory 1gb --appendonly yes
     volumes:
       - stock-db-data:/data
 
   payment-service:
-    build: ./payment
+    build: ../payment
     image: user:latest
     restart: always
     deploy:
-      replicas: 5
+      replicas: 3
       resources:
         limits:
           cpus: '4'
@@ -114,9 +114,9 @@ services:
       - KAFKA_PAYMENT_REPLIES_TOPIC=payment.replies
       - KAFKA_PAYMENT_GROUP_ID=payment-service
       - KAFKA_ORDER_EVENTS_TOPIC=order.events
-    command: gunicorn -b 0.0.0.0:5000 -w 3 --timeout 30 --log-level=info app:app
+    command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
     env_file:
-      - env/payment_redis.env
+      - ../env/payment_redis.env
     depends_on:
       payment-db:
         condition: service_started
@@ -131,8 +131,8 @@ services:
     deploy:
       resources:
         limits:
-          cpus: '3'
-    command: redis-server --requirepass redis --maxmemory 2gb --appendonly yes
+          cpus: '2'
+    command: redis-server --requirepass redis --maxmemory 1gb --appendonly yes
     volumes:
       - payment-db-data:/data
 
@@ -142,7 +142,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: '1'
+          cpus: '0.5'
     environment:
       ZOOKEEPER_CLIENT_PORT: 2181
       ZOOKEEPER_TICK_TIME: 2000
@@ -155,7 +155,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: '9'
+          cpus: '4'
     depends_on:
       - zookeeper
     ports:
@@ -167,7 +167,7 @@ services:
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
-      KAFKA_NUM_PARTITIONS: 15
+      KAFKA_NUM_PARTITIONS: 6
     healthcheck:
       test: ["CMD", "kafka-topics", "--bootstrap-server", "kafka:9092", "--list"]
       interval: 10s
@@ -200,7 +200,7 @@ services:
       kafka:
         condition: service_healthy
     volumes:
-      - ./create_topics_large.sh:/create_topics.sh:ro
+      - ./kafka/create_topics_medium.sh:/create_topics.sh:ro
     entrypoint: [ "/bin/bash", "-c", "tr -d '\\r' < /create_topics.sh | bash" ]
     restart: "no"
 
@@ -209,16 +209,16 @@ services:
     deploy:
       resources:
         limits:
-          cpus: '1'
+          cpus: '0.5'
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
     entrypoint: |
       sh -c '
       while true; do
         for service in \
-          order-processing-order-service-1 order-processing-order-service-2 order-processing-order-service-3 order-processing-order-service-4 order-processing-order-service-5 \
-          order-processing-payment-service-1 order-processing-payment-service-2 order-processing-payment-service-3 order-processing-payment-service-4 order-processing-payment-service-5 \
-          order-processing-stock-service-1 order-processing-stock-service-2 order-processing-stock-service-3 order-processing-stock-service-4 order-processing-stock-service-5 \
+          order-processing-order-service-1 order-processing-order-service-2 order-processing-order-service-3 \
+          order-processing-payment-service-1 order-processing-payment-service-2 order-processing-payment-service-3 \
+          order-processing-stock-service-1 order-processing-stock-service-2 order-processing-stock-service-3 \
           order-processing-order-db-1 order-processing-payment-db-1 order-processing-stock-db-1; do
           STATUS=$$(docker inspect $$service --format="{{.State.Status}}" 2>/dev/null)
           if [ "$$STATUS" = "exited" ] || [ "$$STATUS" = "dead" ]; then
