@@ -9,7 +9,7 @@ The four implementations live in separate folders in this repository and before 
 | [`2pc/`](2pc/README.md) | `2pc_normal_scalability` | 2PC | Order service coordinates directly |
 | [`saga/`](saga/README.md) | `saga_high_load_fix` | Saga | Order service coordinates directly |
 | [`2pc_orchestrator/`](2pc_orchestrator/README.md) | `2pc_orchestrator_scalability` | 2PC | Dedicated orchestrator service |
-| [`saga_orchestrator/`](saga_orchestrator/README.md) | `saga_orchestrator_sentinel` | Saga | Dedicated orchestrator |
+| [`saga_orchestrator/`](saga_orchestrator/README.md) | `saga_orchestrator_sentinel` | Saga | Dedicated orchestrator service |
 
 Each folder contains its own service code, Docker Compose configurations, and
 tests. Choose a folder to run an implementation; no branch switch is required.
