@@ -1,4 +1,4 @@
-# Saga with an orchestrator and Redis Sentinel
+# Saga with an orchestrator
 
 The orchestrator coordinates checkout across the order, stock, and payment
 services. Redis Sentinel provides database failover.
