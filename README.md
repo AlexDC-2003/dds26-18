@@ -2,14 +2,14 @@
 
 We implement a distributed webshop using microservices for order, payment, and stock. Each service has its own Redis database and the services communicate internally through Kafka.
 
-The four implementations live in separate folders in this repository and before were developed on a 4 speerate branches:
+The four implementations live in separate folders in this repository and before were developed on a 4 separate branches:
 
-| Implementation | Branch | Protocol | Architecture |
+| Implementation | Original branch | Protocol | Architecture |
 |---|---|---|---|
 | [`2pc/`](2pc/README.md) | `2pc_normal_scalability` | 2PC | Order service coordinates directly |
 | [`saga/`](saga/README.md) | `saga_high_load_fix` | Saga | Order service coordinates directly |
 | [`2pc_orchestrator/`](2pc_orchestrator/README.md) | `2pc_orchestrator_scalability` | 2PC | Dedicated orchestrator service |
-| [`saga_orchestrator/`](saga_orchestrator/README.md) | `saga_orchestrator_sentinel` | Saga | Dedicated orchestrator service with Redis Sentinel |
+| [`saga_orchestrator/`](saga_orchestrator/README.md) | `saga_orchestrator_sentinel` | Saga | Dedicated orchestrator |
 
 Each folder contains its own service code, Docker Compose configurations, and
 tests. Choose a folder to run an implementation; no branch switch is required.
